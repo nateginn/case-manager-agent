@@ -1,0 +1,15 @@
+ollama
+google-auth
+google-auth-oauthlib
+google-api-python-client
+PyPDF2
+pydantic
+pydantic-settings
+python-dotenv
+chromadb
+loguru
+fastapi
+uvicorn
+requests
+pytest
+pytest-mock
