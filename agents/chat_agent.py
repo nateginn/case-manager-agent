@@ -27,6 +27,7 @@ from config import settings
 from tools.gmail_tool import GmailTool
 from tools.google_chat_tool import GoogleChatTool
 from memory.email_store import EmailStore
+from utils import stage_chat_message
 
 # Shared staging file — same file used by ReferralAgent and BillingAgent.
 _STAGED_MESSAGES_PATH = Path(__file__).parent.parent / "memory" / "staged_chat_messages.json"
@@ -454,21 +455,14 @@ Requirements:
     def _stage_chat_message(
         self, message: str, message_type: str, email_id: str = "", needs_routing: bool = False
     ) -> None:
-        import uuid
-
-        messages = self._read_staged_messages()
-        entry = {
-            "id": str(uuid.uuid4()),
-            "type": message_type,
-            "message": message,
-            "email_id": email_id,
-            "staged_at": datetime.now(timezone.utc).isoformat(),
-            "sent": False,
-            "status": "needs_routing" if needs_routing else "pending",
-        }
-        messages.append(entry)
-        self._write_staged_messages(messages)
-        logger.debug("Staged chat message id={} needs_routing={}", entry["id"], needs_routing)
+        status = "needs_routing" if needs_routing else "pending"
+        stage_chat_message(
+            message=message,
+            message_type=message_type,
+            email_id=email_id,
+            status=status,
+        )
+        logger.debug("Staged chat message needs_routing={}", needs_routing)
     
     # ------------------------------------------------------------------
     # Private helpers — space routing

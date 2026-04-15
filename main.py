@@ -24,11 +24,12 @@ import json
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests as http_requests
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from loguru import logger
 from pydantic import BaseModel
@@ -63,6 +64,10 @@ def _read_all_staged() -> list[dict]:
 _poll_thread: threading.Thread | None = None
 _orchestrator: OrchestratorAgent | None = None
 _chat_agent: ChatAgent | None = None
+
+# Prevents two manual /agent/run calls from running simultaneously.
+_poll_lock = threading.Lock()
+_job_state: dict = {"running": False, "last_status": None}
 
 
 def _polling_worker(interval: int = 60) -> None:
@@ -612,12 +617,16 @@ _DASHBOARD_HTML = """\
   async function runAgent(event) {
     const btn = document.getElementById('run-btn');
     btn.disabled = true;
-    btn.textContent = '\u23f3 Running\u2026';
+    btn.textContent = '\u23f3 Starting\u2026';
     try {
       const r = await fetch('/agent/run', {method: 'POST'});
       const j = await r.json();
-      showToast('Agent pass complete. ' + (j.message || ''));
-      loadData();
+      if (r.status === 409) {
+        showToast('Agent pass already running \u2014 check back shortly.', true);
+      } else {
+        showToast('Agent pass started in background. Results will appear as emails are processed.');
+        loadData();
+      }
     } catch (e) {
       showToast('Error: ' + e.message, true);
     } finally {
@@ -731,24 +740,56 @@ def route_message(message_id: str, body: RouteRequest) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# POST /agent/run — single polling pass
+# POST /agent/run — kick off a background polling pass
 # ---------------------------------------------------------------------------
 
-@app.post("/agent/run")
-def run_agent_pass() -> dict:
-    """
-    Trigger a single pass of the orchestrator poll loop synchronously.
-    Fetches unread unprocessed emails and routes each through the pipeline.
-    This endpoint blocks until the pass completes — suitable for a localhost
-    admin tool; not recommended under concurrent load.
-    """
-    logger.info("Manual agent pass triggered via POST /agent/run")
+def _run_poll_background() -> None:
+    """Background task: run one orchestrator poll pass, then release the lock."""
+    _job_state["running"] = True
     try:
         _orchestrator._poll_once()  # noqa: SLF001
-        return {"status": "completed", "message": "Agent pass finished. Refresh to see results."}
+        _job_state["last_status"] = {
+            "outcome": "completed",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.info("Background agent pass completed")
     except Exception as exc:
-        logger.exception("Manual agent pass failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        _job_state["last_status"] = {
+            "outcome": "error",
+            "error": str(exc),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.error("Background agent pass failed: {}", exc)
+    finally:
+        _job_state["running"] = False
+        _poll_lock.release()
+
+
+@app.post("/agent/run")
+def run_agent_pass(background_tasks: BackgroundTasks) -> dict:
+    """
+    Trigger a single agent polling pass in the background.
+    Returns ``{"status": "started"}`` immediately; the pass runs asynchronously.
+    Returns 409 if a pass is already running.
+    """
+    if not _poll_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Agent pass already running")
+    logger.info("Manual agent pass triggered via POST /agent/run (background)")
+    background_tasks.add_task(_run_poll_background)
+    return {"status": "started"}
+
+
+# ---------------------------------------------------------------------------
+# GET /agent/status — current background pass state
+# ---------------------------------------------------------------------------
+
+@app.get("/agent/status")
+def agent_status() -> dict:
+    """Return whether a background agent pass is running and the last completion status."""
+    return {
+        "running": _job_state["running"],
+        "last_status": _job_state["last_status"],
+    }
 
 
 # ---------------------------------------------------------------------------

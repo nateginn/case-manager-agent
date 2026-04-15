@@ -14,10 +14,6 @@ boolean flags are logged.
 
 from __future__ import annotations
 
-import json
-import uuid
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Literal
 
 import ollama
@@ -26,9 +22,7 @@ from loguru import logger
 from config import settings
 from tools.gmail_tool import GmailTool
 from memory.email_store import EmailStore
-
-# Path to the local staging table shared with ReferralAgent.
-_STAGED_MESSAGES_PATH = Path(__file__).parent.parent / "memory" / "staged_chat_messages.json"
+from utils import stage_chat_message
 
 # Shared clinic system prompt for every Ollama call in this agent.
 _CLINIC_SYSTEM_PROMPT = (
@@ -168,6 +162,19 @@ class BillingAgent:
             message_id,
             draft_id,
         )
+
+        try:
+            self.store.save_summary(
+                email_id=message_id,
+                summary=(
+                    f"Billing {subtype.replace('_', ' ')} processed. "
+                    "Draft reply created for sender."
+                ),
+                classification="billing",
+            )
+        except Exception as exc:
+            logger.warning("save_summary failed message_id={}: {}", message_id, exc)
+
         return draft_id
 
     # ------------------------------------------------------------------
@@ -347,7 +354,7 @@ Instructions:
             f"Needs attention."
         )
 
-        self._stage_chat_message(
+        stage_chat_message(
             message=message,
             message_type="billing_team_notification",
             email_id=message_id,
@@ -358,68 +365,6 @@ Instructions:
             subtype,
         )
         return message
-
-    # ------------------------------------------------------------------
-    # Private helpers — chat message staging
-    # ------------------------------------------------------------------
-
-    def _stage_chat_message(
-        self, message: str, message_type: str, email_id: str = ""
-    ) -> None:
-        """
-        Append *message* to the local staging table at
-        ``memory/staged_chat_messages.json``.
-
-        The file holds a JSON array of objects::
-
-            {
-              "id":           "<uuid>",
-              "type":         "<message_type>",
-              "message":      "<text>",
-              "email_id":     "<gmail message id>",
-              "staged_at":    "<ISO 8601 UTC>",
-              "sent":         false
-            }
-
-        The file is created if it does not exist.  We read-modify-write to
-        preserve any previously staged messages; write errors are logged but
-        do not raise so the primary pipeline always completes.
-        """
-        _STAGED_MESSAGES_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-        existing: list[dict] = []
-        if _STAGED_MESSAGES_PATH.exists():
-            try:
-                existing = json.loads(_STAGED_MESSAGES_PATH.read_text(encoding="utf-8"))
-                if not isinstance(existing, list):
-                    logger.warning(
-                        "staged_chat_messages.json had unexpected root type; resetting"
-                    )
-                    existing = []
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.error("Could not read staged chat messages file: {}", exc)
-                existing = []
-
-        entry = {
-            "id": str(uuid.uuid4()),
-            "type": message_type,
-            "message": message,
-            "email_id": email_id,
-            "staged_at": datetime.now(timezone.utc).isoformat(),
-            "sent": False,
-        }
-        existing.append(entry)
-
-        try:
-            _STAGED_MESSAGES_PATH.write_text(
-                json.dumps(existing, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            logger.debug(
-                "Staged chat message id={} to {}", entry["id"], _STAGED_MESSAGES_PATH
-            )
-        except OSError as exc:
-            logger.error("Failed to write staged chat messages file: {}", exc)
 
     # ------------------------------------------------------------------
     # Private helpers — string utilities

@@ -157,6 +157,22 @@ class OrchestratorAgent:
         email_id: str = email.get("id", "")
         subject: str = email.get("subject", "(no subject)")
 
+        # Double-check: skip if this message was labelled between the list
+        # query and now.  Guards against two concurrent /agent/run calls
+        # both fetching the same inbox snapshot before either applies the
+        # agent-processed label.
+        if self.gmail.is_processed(email_id):
+            logger.info(
+                "Skipping email id={} — already labelled agent-processed (concurrent pass guard)",
+                email_id,
+            )
+            return ProcessingResult(
+                email_id=email_id,
+                classification="unknown",
+                agent_status="skipped",
+                notes="Skipped — already processed by a concurrent agent pass",
+            )
+
         classification = self.classify_email(email)
 
         draft_id: str | None = None

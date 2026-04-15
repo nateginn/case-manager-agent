@@ -30,6 +30,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/chat.messages.create",
 ]
 
 TOKEN_PATH = Path("token.json")
@@ -248,6 +249,45 @@ class GmailTool:
             PROCESSED_LABEL_NAME,
             label_id,
         )
+
+    def is_processed(self, message_id: str) -> bool:
+        """
+        Return True if *message_id* already carries the ``agent-processed`` label.
+
+        Used as a double-check guard before dispatching an email so two
+        concurrent agent passes cannot process the same message twice.
+        Fails open (returns False) on any API error so a transient label
+        lookup failure never silently drops an email.
+
+        PHI note: only the message ID is logged.
+        """
+        try:
+            label_id = self._get_or_create_processed_label()
+            msg = (
+                self._service.users()
+                .messages()
+                .get(
+                    userId=settings.GMAIL_USER_EMAIL,
+                    id=message_id,
+                    format="metadata",
+                    metadataHeaders=[],
+                )
+                .execute()
+            )
+            already = label_id in msg.get("labelIds", [])
+            if already:
+                logger.info(
+                    "is_processed=True for message_id={} (already labelled)",
+                    message_id,
+                )
+            return already
+        except Exception as exc:
+            logger.warning(
+                "is_processed check failed for message_id={}: {} — treating as not processed",
+                message_id,
+                exc,
+            )
+            return False
 
     # ------------------------------------------------------------------
     # 6. List drafts

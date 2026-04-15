@@ -58,7 +58,9 @@ def orchestrator():
         patch("agents.orchestrator.BillingAgent") as mock_billing_cls,
         patch("agents.orchestrator.ChatAgent") as mock_chat_cls,
     ):
-        mock_gmail_cls.return_value = MagicMock()
+        mock_gmail = MagicMock()
+        mock_gmail.is_processed.return_value = False
+        mock_gmail_cls.return_value = mock_gmail
         mock_referral_cls.return_value = MagicMock()
         mock_billing_cls.return_value = MagicMock()
         mock_chat_cls.return_value = MagicMock()
