@@ -77,67 +77,67 @@ def orchestrator():
 
 
 class TestClassifyEmail:
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_returns_referral(self, mock_ollama, orchestrator):
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("referral")
+        mock_ollama.chat.return_value = _ollama_response("referral")
         assert orch.classify_email(_make_email()) == "referral"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_returns_billing(self, mock_ollama, orchestrator):
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("billing")
+        mock_ollama.chat.return_value = _ollama_response("billing")
         assert orch.classify_email(_make_email()) == "billing"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_returns_internal(self, mock_ollama, orchestrator):
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("internal")
+        mock_ollama.chat.return_value = _ollama_response("internal")
         assert orch.classify_email(_make_email()) == "internal"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_returns_unknown(self, mock_ollama, orchestrator):
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("unknown")
+        mock_ollama.chat.return_value = _ollama_response("unknown")
         assert orch.classify_email(_make_email()) == "unknown"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_garbage_output_defaults_to_unknown(self, mock_ollama, orchestrator):
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response(
+        mock_ollama.chat.return_value = _ollama_response(
             "I cannot determine the classification."
         )
         assert orch.classify_email(_make_email()) == "unknown"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_empty_output_defaults_to_unknown(self, mock_ollama, orchestrator):
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("")
+        mock_ollama.chat.return_value = _ollama_response("")
         assert orch.classify_email(_make_email()) == "unknown"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_trailing_period_stripped(self, mock_ollama, orchestrator):
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("referral.")
+        mock_ollama.chat.return_value = _ollama_response("referral.")
         assert orch.classify_email(_make_email()) == "referral"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_trailing_newline_stripped(self, mock_ollama, orchestrator):
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("billing\n")
+        mock_ollama.chat.return_value = _ollama_response("billing\n")
         assert orch.classify_email(_make_email()) == "billing"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_uppercase_normalised(self, mock_ollama, orchestrator):
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("REFERRAL")
+        mock_ollama.chat.return_value = _ollama_response("REFERRAL")
         assert orch.classify_email(_make_email()) == "referral"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_only_first_word_used(self, mock_ollama, orchestrator):
         """LLM says two words; only the first word should be evaluated."""
         orch, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("billing inquiry")
+        mock_ollama.chat.return_value = _ollama_response("billing inquiry")
         assert orch.classify_email(_make_email()) == "billing"
 
 
@@ -146,10 +146,10 @@ class TestClassifyEmail:
 # ---------------------------------------------------------------------------
 
 class TestProcessEmailRouting:
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_referral_routes_to_referral_agent(self, mock_ollama, orchestrator):
         orch, mock_referral, mock_billing, mock_chat = orchestrator
-        mock_ollama.return_value = _ollama_response("referral")
+        mock_ollama.chat.return_value = _ollama_response("referral")
         mock_referral.run.return_value = {"status": "draft", "draft_id": "d1"}
 
         result = orch.process_email(_make_email())
@@ -159,10 +159,10 @@ class TestProcessEmailRouting:
         mock_chat.run.assert_not_called()
         assert result.classification == "referral"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_billing_routes_to_billing_agent(self, mock_ollama, orchestrator):
         orch, mock_referral, mock_billing, mock_chat = orchestrator
-        mock_ollama.return_value = _ollama_response("billing")
+        mock_ollama.chat.return_value = _ollama_response("billing")
         mock_billing.run.return_value = {"status": "draft", "draft_id": "d2"}
 
         result = orch.process_email(_make_email())
@@ -171,10 +171,10 @@ class TestProcessEmailRouting:
         mock_referral.run.assert_not_called()
         assert result.classification == "billing"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_internal_routes_to_chat_agent(self, mock_ollama, orchestrator):
         orch, mock_referral, mock_billing, mock_chat = orchestrator
-        mock_ollama.return_value = _ollama_response("internal")
+        mock_ollama.chat.return_value = _ollama_response("internal")
         mock_chat.run.return_value = {"status": "ok"}
 
         result = orch.process_email(_make_email())
@@ -183,10 +183,10 @@ class TestProcessEmailRouting:
         mock_referral.run.assert_not_called()
         assert result.classification == "internal"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_unknown_creates_review_draft(self, mock_ollama, orchestrator):
         orch, mock_referral, mock_billing, mock_chat = orchestrator
-        mock_ollama.return_value = _ollama_response("unknown")
+        mock_ollama.chat.return_value = _ollama_response("unknown")
 
         # Mock the gmail create_draft call inside _create_review_draft
         orch.gmail.create_draft.return_value = "review_draft_id"
@@ -199,21 +199,21 @@ class TestProcessEmailRouting:
         mock_billing.run.assert_not_called()
         assert result.classification == "unknown"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_agent_exception_sets_error_status(self, mock_ollama, orchestrator):
         orch, mock_referral, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("referral")
+        mock_ollama.chat.return_value = _ollama_response("referral")
         mock_referral.run.side_effect = RuntimeError("Ollama down")
 
         result = orch.process_email(_make_email())
 
         assert result.agent_status == "error"
 
-    @patch("agents.orchestrator.ollama.chat")
+    @patch("agents.orchestrator._ollama_client")
     def test_mark_as_processed_always_called(self, mock_ollama, orchestrator):
         """mark_as_processed should be called regardless of classification."""
         orch, mock_referral, *_ = orchestrator
-        mock_ollama.return_value = _ollama_response("referral")
+        mock_ollama.chat.return_value = _ollama_response("referral")
         mock_referral.run.return_value = {"status": "draft"}
 
         orch.process_email(_make_email())
@@ -242,44 +242,44 @@ def billing_agent():
 
 
 class TestBillingSubtypeClassification:
-    @patch("agents.billing_agent.ollama.chat")
+    @patch("agents.billing_agent._ollama_client")
     def test_eligibility_question(self, mock_ollama, billing_agent):
-        mock_ollama.return_value = _ollama_response("eligibility_question")
+        mock_ollama.chat.return_value = _ollama_response("eligibility_question")
         result = billing_agent._classify_subtype(_make_email())  # noqa: SLF001
         assert result == "eligibility_question"
 
-    @patch("agents.billing_agent.ollama.chat")
+    @patch("agents.billing_agent._ollama_client")
     def test_claim_status(self, mock_ollama, billing_agent):
-        mock_ollama.return_value = _ollama_response("claim_status")
+        mock_ollama.chat.return_value = _ollama_response("claim_status")
         result = billing_agent._classify_subtype(_make_email())  # noqa: SLF001
         assert result == "claim_status"
 
-    @patch("agents.billing_agent.ollama.chat")
+    @patch("agents.billing_agent._ollama_client")
     def test_authorization_request(self, mock_ollama, billing_agent):
-        mock_ollama.return_value = _ollama_response("authorization_request")
+        mock_ollama.chat.return_value = _ollama_response("authorization_request")
         result = billing_agent._classify_subtype(_make_email())  # noqa: SLF001
         assert result == "authorization_request"
 
-    @patch("agents.billing_agent.ollama.chat")
+    @patch("agents.billing_agent._ollama_client")
     def test_payment_inquiry(self, mock_ollama, billing_agent):
-        mock_ollama.return_value = _ollama_response("payment_inquiry")
+        mock_ollama.chat.return_value = _ollama_response("payment_inquiry")
         result = billing_agent._classify_subtype(_make_email())  # noqa: SLF001
         assert result == "payment_inquiry"
 
-    @patch("agents.billing_agent.ollama.chat")
+    @patch("agents.billing_agent._ollama_client")
     def test_other(self, mock_ollama, billing_agent):
-        mock_ollama.return_value = _ollama_response("other")
+        mock_ollama.chat.return_value = _ollama_response("other")
         result = billing_agent._classify_subtype(_make_email())  # noqa: SLF001
         assert result == "other"
 
-    @patch("agents.billing_agent.ollama.chat")
+    @patch("agents.billing_agent._ollama_client")
     def test_garbage_defaults_to_other(self, mock_ollama, billing_agent):
-        mock_ollama.return_value = _ollama_response("I am not sure.")
+        mock_ollama.chat.return_value = _ollama_response("I am not sure.")
         result = billing_agent._classify_subtype(_make_email())  # noqa: SLF001
         assert result == "other"
 
-    @patch("agents.billing_agent.ollama.chat")
+    @patch("agents.billing_agent._ollama_client")
     def test_punctuation_stripped(self, mock_ollama, billing_agent):
-        mock_ollama.return_value = _ollama_response("claim_status.")
+        mock_ollama.chat.return_value = _ollama_response("claim_status.")
         result = billing_agent._classify_subtype(_make_email())  # noqa: SLF001
         assert result == "claim_status"

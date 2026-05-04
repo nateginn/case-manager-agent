@@ -133,7 +133,87 @@ class GmailTool:
         return emails
 
     # ------------------------------------------------------------------
-    # 3. Fetch attachment bytes
+    # 3. Fetch thread history
+    # ------------------------------------------------------------------
+
+    def fetch_thread(self, thread_id: str, current_message_id: str = "") -> list[dict]:
+        """
+        Return prior messages in the Gmail thread, excluding the current email.
+
+        Calls users.threads.get with format='full', sorts messages by
+        internalDate oldest-first (the API returns them in that order, but we
+        sort explicitly to be safe), and extracts sender, date, and plain-text
+        body for each message that is not *current_message_id*.
+
+        Returns an empty list if the thread has only one message, if
+        *thread_id* is empty, or if the API call fails (graceful degradation).
+
+        PHI note: message bodies are returned to the caller but never logged.
+
+        Args:
+            thread_id:          Gmail thread ID to fetch.
+            current_message_id: ID of the email currently being processed;
+                                excluded from the returned history.
+
+        Returns:
+            List of ``{"sender": str, "date": str, "body": str}`` dicts,
+            oldest message first.
+        """
+        if not thread_id:
+            return []
+
+        try:
+            thread = (
+                self._service.users()
+                .threads()
+                .get(
+                    userId=settings.GMAIL_USER_EMAIL,
+                    id=thread_id,
+                    format="full",
+                )
+                .execute()
+            )
+        except Exception as exc:
+            logger.warning(
+                "fetch_thread failed for thread_id={}: {} — returning empty history",
+                thread_id,
+                exc,
+            )
+            return []
+
+        messages: list[dict] = thread.get("messages", [])
+        if len(messages) <= 1:
+            return []
+
+        # Sort oldest-first by internalDate (Gmail returns oldest-first in
+        # practice, but sort explicitly for correctness).
+        messages = sorted(messages, key=lambda m: int(m.get("internalDate", 0)))
+
+        history: list[dict] = []
+        for msg in messages:
+            if msg.get("id") == current_message_id:
+                continue
+
+            headers = {
+                h["name"].lower(): h["value"]
+                for h in msg.get("payload", {}).get("headers", [])
+            }
+            body_text, _, _, _ = self._extract_parts(msg.get("payload", {}))
+            history.append({
+                "sender": headers.get("from", ""),
+                "date": headers.get("date", ""),
+                "body": body_text,
+            })
+
+        logger.debug(
+            "fetch_thread thread_id={} prior_messages={}",
+            thread_id,
+            len(history),
+        )
+        return history
+
+    # ------------------------------------------------------------------
+    # 4. Fetch attachment bytes
     # ------------------------------------------------------------------
 
     def fetch_attachment(self, message_id: str, attachment_id: str) -> bytes:
@@ -288,6 +368,30 @@ class GmailTool:
                 exc,
             )
             return False
+
+    # ------------------------------------------------------------------
+    # 5b. Apply arbitrary label (e.g. "agent-timed-out")
+    # ------------------------------------------------------------------
+
+    def apply_label(self, message_id: str, label_name: str) -> None:
+        """
+        Apply a Gmail label by name to *message_id*, creating the label if it
+        does not already exist.
+
+        PHI note: only the message ID is logged.
+        """
+        label_id = self._get_or_create_label(label_name)
+        self._service.users().messages().modify(
+            userId=settings.GMAIL_USER_EMAIL,
+            id=message_id,
+            body={"addLabelIds": [label_id], "removeLabelIds": []},
+        ).execute()
+        logger.info(
+            "Applied label {!r} ({}) to message_id={}",
+            label_name,
+            label_id,
+            message_id,
+        )
 
     # ------------------------------------------------------------------
     # 6. List drafts
@@ -570,6 +674,38 @@ class GmailTool:
     # ------------------------------------------------------------------
     # Private helpers — label management
     # ------------------------------------------------------------------
+
+    def _get_or_create_label(self, label_name: str) -> str:
+        """
+        Return the label ID for *label_name*, creating the label if it does
+        not already exist.  Does not cache; used for infrequent labels.
+        """
+        existing = (
+            self._service.users()
+            .labels()
+            .list(userId=settings.GMAIL_USER_EMAIL)
+            .execute()
+            .get("labels", [])
+        )
+        for label in existing:
+            if label.get("name") == label_name:
+                return label["id"]
+
+        created = (
+            self._service.users()
+            .labels()
+            .create(
+                userId=settings.GMAIL_USER_EMAIL,
+                body={
+                    "name": label_name,
+                    "labelListVisibility": "labelShow",
+                    "messageListVisibility": "show",
+                },
+            )
+            .execute()
+        )
+        logger.info("Created Gmail label {!r} id={}", label_name, created["id"])
+        return created["id"]
 
     def _get_or_create_processed_label(self) -> str:
         """

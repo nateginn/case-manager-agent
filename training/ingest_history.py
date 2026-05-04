@@ -39,6 +39,8 @@ from typing import Any
 import ollama
 from loguru import logger
 
+_ollama_client = ollama.Client(timeout=180)
+
 from config import settings
 from memory.email_store import EmailStore
 from tools.gmail_tool import GmailTool
@@ -434,7 +436,7 @@ class HistoryIngester:
         )
 
         try:
-            response = ollama.chat(
+            response = _ollama_client.chat(
                 model=settings.OLLAMA_MODEL,
                 options={"temperature": 0.1},
                 messages=[

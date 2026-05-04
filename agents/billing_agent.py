@@ -19,10 +19,13 @@ from typing import Literal
 import ollama
 from loguru import logger
 
+_ollama_client = ollama.Client(timeout=180)
+
 from config import settings
 from tools.gmail_tool import GmailTool
 from memory.email_store import EmailStore
 from utils import stage_chat_message
+from training.ingest_history import phi_scrub
 
 # Shared clinic system prompt for every Ollama call in this agent.
 _CLINIC_SYSTEM_PROMPT = (
@@ -94,7 +97,17 @@ class BillingAgent:
             draft_id = self.process(email)
             return {"status": "draft" if settings.DRAFT_MODE else "processed", "draft_id": draft_id}
         except Exception as exc:
-            logger.exception("BillingAgent failed on email id={}", email.get("id"))
+            email_id = email.get("id", "")
+            logger.error(
+                "BillingAgent failed on email id={}: {}",
+                email_id,
+                exc,
+            )
+            if email_id:
+                try:
+                    self.gmail.apply_label(email_id, "agent-timed-out")
+                except Exception:
+                    pass
             return {"status": "error", "error": str(exc)}
 
     # ------------------------------------------------------------------
@@ -197,7 +210,7 @@ class BillingAgent:
         body_snippet: str = (email.get("body_text") or email.get("body_html") or "")[:500]
         user_message = f"Subject: {subject}\n\nBody (first 500 chars):\n{body_snippet}"
 
-        response = ollama.chat(
+        response = _ollama_client.chat(
             model=settings.OLLAMA_MODEL,
             options={"temperature": 0.0},
             messages=[
@@ -250,6 +263,17 @@ class BillingAgent:
         """
         subject: str = email.get("subject", "")
         sender: str = email.get("sender", "")
+        thread_history: list[dict] = email.get("thread_history", [])
+
+        history_block = ""
+        if thread_history:
+            lines = ["--- Prior Conversation History ---"]
+            for msg in thread_history:
+                lines.append(f"[{msg.get('date', '')}] From: {msg.get('sender', '')}")
+                lines.append(phi_scrub(msg.get("body", "")))
+                lines.append("")
+            lines.append("--- End History ---")
+            history_block = "\n".join(lines) + "\n\n"
 
         instructions: dict[str, str] = {
             "eligibility_question": (
@@ -284,6 +308,7 @@ class BillingAgent:
         instruction = instructions.get(subtype, instructions["other"])
 
         user_prompt = f"""\
+{history_block}Current Email:
 Write a professional acknowledgment email replying to a billing or insurance inquiry.
 
 Context:
@@ -299,7 +324,7 @@ Instructions:
 - End with a closing and the clinic name placeholder "[Clinic Name]"
 - Return the email body text only"""
 
-        response = ollama.chat(
+        response = _ollama_client.chat(
             model=settings.OLLAMA_MODEL,
             options={"temperature": 0.3},
             messages=[

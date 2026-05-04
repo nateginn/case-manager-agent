@@ -45,13 +45,38 @@ from agents.chat_agent import ChatAgent
 _STAGED_PATH = Path(__file__).parent / "memory" / "staged_chat_messages.json"
 
 
+def _write_staged(entries: list[dict]) -> None:
+    """Rewrite staged_chat_messages.json with *entries*."""
+    _STAGED_PATH.write_text(
+        json.dumps(entries, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _backfill_uuids(entries: list[dict]) -> list[dict]:
+    """Ensure every entry has a stable 'id'; rewrites the file if any were missing."""
+    import uuid as _uuid
+    modified = False
+    for entry in entries:
+        if not entry.get("id"):
+            entry["id"] = str(_uuid.uuid4())
+            modified = True
+    if modified:
+        try:
+            _write_staged(entries)
+        except OSError as exc:
+            logger.warning("backfill_uuids: write failed: {}", exc)
+    return entries
+
+
 def _read_all_staged() -> list[dict]:
     """Read the raw staged messages JSON file; return empty list on any error."""
     if not _STAGED_PATH.exists():
         return []
     try:
         data = json.loads(_STAGED_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        entries = data if isinstance(data, list) else []
+        return _backfill_uuids(entries)
     except (json.JSONDecodeError, OSError) as exc:
         logger.error("Could not read staged messages for dashboard: {}", exc)
         return []
@@ -153,6 +178,9 @@ class RejectRequest(BaseModel):
 
 class RouteRequest(BaseModel):
     office: str  # "denver" or "greeley"
+
+class IdsRequest(BaseModel):
+    ids: list[str]
 
 # ---------------------------------------------------------------------------
 # GET / — HTML dashboard
@@ -345,6 +373,23 @@ _DASHBOARD_HTML = """\
     .col-preview { color: #64748b; font-size: 12px; }
     .col-target  { width: 120px; font-weight: 600; }
     .col-created { width: 130px; white-space: nowrap; color: #475569; font-size: 12px; }
+    .col-cb      { width: 36px; text-align: center; padding: 10px 6px; }
+
+    /* ---- Duplicate rows ---- */
+    tr.dup-row td { background: #fffbeb; }
+    tr.dup-row:hover td { background: #fef3c7; }
+
+    /* ---- Queue toolbar ---- */
+    .queue-toolbar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      padding: 10px 0 14px;
+      border-bottom: 1px solid #e2e8f0;
+      margin-bottom: 14px;
+    }
+    .btn-amber  { background: #f59e0b; color: #fff; }
   </style>
 </head>
 <body>
@@ -401,9 +446,25 @@ _DASHBOARD_HTML = """\
       <h2>Google Chat Queue</h2>
       <span class="badge" id="staged-badge">&hellip;</span>
     </div>
+    <!-- Bulk-action toolbar -->
+    <div class="queue-toolbar">
+      <button class="btn btn-amber" id="btn-clear-dups" onclick="clearDuplicates()">
+        &#9888; Clear Duplicates (<span id="dup-count">0</span>)
+      </button>
+      <button class="btn btn-danger" id="btn-clear-sel" onclick="clearSelected()" disabled>
+        &#128465; Clear Selected
+      </button>
+      <button class="btn btn-gray" id="btn-reject-sel" onclick="rejectSelected()" disabled>
+        &#10007; Reject Selected
+      </button>
+      <button class="btn btn-danger" id="btn-clear-all" onclick="clearAll()">
+        &#128465; Clear All
+      </button>
+    </div>
     <table>
       <thead>
         <tr>
+          <th class="col-cb"><input type="checkbox" id="sel-all" onchange="toggleSelectAll(this)" title="Select all"></th>
           <th>Target</th>
           <th>Message</th>
           <th>Created At</th>
@@ -411,7 +472,7 @@ _DASHBOARD_HTML = """\
         </tr>
       </thead>
       <tbody id="staged-body">
-        <tr><td colspan="4" class="empty-row" style="font-style:italic;color:#94a3b8">Loading&hellip;</td></tr>
+        <tr><td colspan="5" class="empty-row" style="font-style:italic;color:#94a3b8">Loading&hellip;</td></tr>
       </tbody>
     </table>
   </div>
@@ -532,16 +593,56 @@ _DASHBOARD_HTML = """\
     }).join('');
   }
 
+  // ---- Duplicate detection ----
+
+  function dupKey(m) {
+    // Message text is the unique fingerprint — it encodes type + sender + subject.
+    return m.message || '';
+  }
+
+  function findDuplicateIds(staged) {
+    // Returns a Set of IDs that are NOT the newest entry in their duplicate group.
+    const groups = {};
+    for (const m of staged) {
+      const k = dupKey(m);
+      if (!groups[k]) groups[k] = [];
+      groups[k].push(m);
+    }
+    const toRemove = new Set();
+    for (const group of Object.values(groups)) {
+      if (group.length <= 1) continue;
+      // Sort newest-first by staged_at; keep the first, flag the rest.
+      group.sort((a, b) => (b.staged_at || '').localeCompare(a.staged_at || ''));
+      for (let i = 1; i < group.length; i++) toRemove.add(group[i].id);
+    }
+    return toRemove;
+  }
+
   // ---- Render staged messages ----
 
   function renderStaged(staged) {
     document.getElementById('staged-badge').textContent = staged.length;
+    const dupIds = findDuplicateIds(staged);
+
+    // Update duplicate count label and button state.
+    document.getElementById('dup-count').textContent = dupIds.size;
+    document.getElementById('btn-clear-dups').disabled = dupIds.size === 0;
+
+    // Reset selection state on every re-render.
+    const selAll = document.getElementById('sel-all');
+    selAll.checked = false;
+    selAll.indeterminate = false;
+    document.getElementById('btn-clear-sel').disabled = true;
+    document.getElementById('btn-reject-sel').disabled = true;
+
     const tbody = document.getElementById('staged-body');
     if (!staged.length) {
-      tbody.innerHTML = '<tr class="empty-row"><td colspan="4">No pending messages</td></tr>';
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No pending messages</td></tr>';
       return;
     }
     tbody.innerHTML = staged.map(m => {
+      const isDup = dupIds.has(m.id);
+      const rowClass = isDup ? ' class="dup-row"' : '';
       const target = targetLabel(m.type, m.status);
       const preview = esc((m.message || '').slice(0, 140));
       const actionBtns = m.status === 'needs_routing'
@@ -550,7 +651,8 @@ _DASHBOARD_HTML = """\
            <button class="btn btn-gray" onclick="rejectMsg('${esc(m.id)}')">Reject</button>`
         : `<button class="btn btn-success" onclick="approveMsg('${esc(m.id)}')">Approve &amp; Send</button>
            <button class="btn btn-gray" onclick="rejectMsg('${esc(m.id)}')">Reject</button>`;
-      return `<tr>
+      return `<tr${rowClass}>
+        <td class="col-cb"><input type="checkbox" class="row-cb" value="${esc(m.id)}" onchange="onCbChange()"></td>
         <td class="col-target">${target}</td>
         <td>${preview}</td>
         <td class="col-created">${fmtIso(m.staged_at)}</td>
@@ -635,6 +737,83 @@ _DASHBOARD_HTML = """\
     }
   }
 
+  // ---- Checkbox selection helpers ----
+
+  function getSelectedIds() {
+    return Array.from(document.querySelectorAll('.row-cb:checked')).map(cb => cb.value);
+  }
+
+  function onCbChange() {
+    const all = document.querySelectorAll('.row-cb');
+    const checked = document.querySelectorAll('.row-cb:checked');
+    const selAll = document.getElementById('sel-all');
+    selAll.indeterminate = checked.length > 0 && checked.length < all.length;
+    selAll.checked = all.length > 0 && checked.length === all.length;
+    const hasSelection = checked.length > 0;
+    document.getElementById('btn-clear-sel').disabled = !hasSelection;
+    document.getElementById('btn-reject-sel').disabled = !hasSelection;
+  }
+
+  function toggleSelectAll(cb) {
+    document.querySelectorAll('.row-cb').forEach(el => { el.checked = cb.checked; });
+    onCbChange();
+  }
+
+  // ---- Bulk action handlers ----
+
+  async function clearSelected() {
+    const ids = getSelectedIds();
+    if (!ids.length) { showToast('Nothing selected.', true); return; }
+    try {
+      const r = await fetch('/chat-queue/selected', {
+        method: 'DELETE',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ids}),
+      });
+      const j = await r.json();
+      showToast(`Removed ${j.removed} entr${j.removed === 1 ? 'y' : 'ies'}.`);
+      loadData();
+    } catch (e) { showToast('Error: ' + e.message, true); }
+  }
+
+  async function rejectSelected() {
+    const ids = getSelectedIds();
+    if (!ids.length) { showToast('Nothing selected.', true); return; }
+    try {
+      const r = await fetch('/chat-queue/reject-selected', {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ids}),
+      });
+      const j = await r.json();
+      showToast(`Rejected ${j.updated} entr${j.updated === 1 ? 'y' : 'ies'}.`);
+      loadData();
+    } catch (e) { showToast('Error: ' + e.message, true); }
+  }
+
+  async function clearDuplicates() {
+    try {
+      const r = await fetch('/chat-queue/duplicates', {method: 'DELETE'});
+      const j = await r.json();
+      if (j.removed === 0) {
+        showToast('No duplicates found.');
+      } else {
+        showToast(`Removed ${j.removed} duplicate entr${j.removed === 1 ? 'y' : 'ies'}.`);
+      }
+      loadData();
+    } catch (e) { showToast('Error: ' + e.message, true); }
+  }
+
+  async function clearAll() {
+    if (!confirm('Remove every entry from the staged chat queue? This cannot be undone.')) return;
+    try {
+      const r = await fetch('/chat-queue/all', {method: 'DELETE'});
+      const j = await r.json();
+      showToast(`Queue cleared (${j.cleared} entr${j.cleared === 1 ? 'y' : 'ies'} removed).`);
+      loadData();
+    } catch (e) { showToast('Error: ' + e.message, true); }
+  }
+
   // Initial load; auto-refresh every 30 s
   loadData();
   setInterval(loadData, 30000);
@@ -690,6 +869,78 @@ def get_staged() -> list[dict]:
     pending) and the status counters (all statuses).
     """
     return _read_all_staged()
+
+
+# ---------------------------------------------------------------------------
+# DELETE /chat-queue/selected — remove entries by ID
+# ---------------------------------------------------------------------------
+
+@app.delete("/chat-queue/selected")
+def queue_delete_selected(body: IdsRequest) -> dict:
+    """Remove specific staged entries by their ID."""
+    entries = _read_all_staged()
+    id_set = set(body.ids)
+    remaining = [e for e in entries if e.get("id") not in id_set]
+    removed = len(entries) - len(remaining)
+    _write_staged(remaining)
+    logger.info("queue_delete_selected removed={}", removed)
+    return {"removed": removed}
+
+
+# ---------------------------------------------------------------------------
+# DELETE /chat-queue/duplicates — keep newest per message-text group
+# ---------------------------------------------------------------------------
+
+@app.delete("/chat-queue/duplicates")
+def queue_delete_duplicates() -> dict:
+    """Remove duplicate staged entries, keeping the newest per message-text group."""
+    entries = _read_all_staged()
+    # Walk newest-first; first occurrence of each message text wins.
+    seen: dict[str, bool] = {}
+    kept: list[dict] = []
+    for entry in sorted(entries, key=lambda e: e.get("staged_at", ""), reverse=True):
+        key = entry.get("message", "")
+        if key not in seen:
+            seen[key] = True
+            kept.append(entry)
+    removed = len(entries) - len(kept)
+    if removed:
+        kept.sort(key=lambda e: e.get("staged_at", ""))
+        _write_staged(kept)
+    logger.info("queue_delete_duplicates removed={} kept={}", removed, len(kept))
+    return {"removed": removed, "kept": len(kept)}
+
+
+# ---------------------------------------------------------------------------
+# DELETE /chat-queue/all — clear the entire queue
+# ---------------------------------------------------------------------------
+
+@app.delete("/chat-queue/all")
+def queue_delete_all() -> dict:
+    """Overwrite the staged queue with an empty list."""
+    count = len(_read_all_staged())
+    _write_staged([])
+    logger.info("queue_delete_all cleared={}", count)
+    return {"cleared": count}
+
+
+# ---------------------------------------------------------------------------
+# PATCH /chat-queue/reject-selected — bulk reject by ID
+# ---------------------------------------------------------------------------
+
+@app.patch("/chat-queue/reject-selected")
+def queue_reject_selected(body: IdsRequest) -> dict:
+    """Set status=rejected on the specified staged entries."""
+    entries = _read_all_staged()
+    id_set = set(body.ids)
+    updated = 0
+    for entry in entries:
+        if entry.get("id") in id_set:
+            entry["status"] = "rejected"
+            updated += 1
+    _write_staged(entries)
+    logger.info("queue_reject_selected updated={}", updated)
+    return {"updated": updated}
 
 
 # ---------------------------------------------------------------------------

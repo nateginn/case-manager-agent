@@ -23,6 +23,8 @@ from pathlib import Path
 import ollama
 from loguru import logger
 
+_ollama_client = ollama.Client(timeout=180)
+
 from config import settings
 from tools.gmail_tool import GmailTool
 from tools.google_chat_tool import GoogleChatTool
@@ -108,10 +110,14 @@ class ChatAgent:
         messages.extend(history)
         messages.append({"role": "user", "content": user_text})
 
-        response = ollama.chat(
-            model=settings.OLLAMA_MODEL,
-            messages=messages,
-        )
+        try:
+            response = _ollama_client.chat(
+                model=settings.OLLAMA_MODEL,
+                messages=messages,
+            )
+        except Exception as exc:
+            logger.error("Ollama error in ChatAgent.run: {}", exc)
+            return {"status": "error", "message": f"Ollama call failed: {exc}"}
         reply = response["message"]["content"].strip()
         logger.debug("ChatAgent reply length={}", len(reply))
 
@@ -160,7 +166,19 @@ class ChatAgent:
         )
 
         # --- b. LLM analysis ---
-        analysis = self._analyse_internal_email(subject, body_text)
+        try:
+            analysis = self._analyse_internal_email(subject, body_text)
+        except Exception as exc:
+            logger.error(
+                "Ollama error in _analyse_internal_email message_id={}: {}",
+                message_id,
+                exc,
+            )
+            try:
+                self.gmail.apply_label(message_id, "agent-timed-out")
+            except Exception:
+                pass
+            return None
         needs_notification: bool = analysis.get("needs_chat_notification", False)
         needs_reply: bool = analysis.get("needs_reply", False)
         logger.info(
@@ -184,7 +202,19 @@ class ChatAgent:
         draft_id: str | None = None
         if needs_reply:
             reply_context: str = analysis.get("reply_context") or ""
-            reply_body = self._draft_internal_reply(email, reply_context)
+            try:
+                reply_body = self._draft_internal_reply(email, reply_context)
+            except Exception as exc:
+                logger.error(
+                    "Ollama error in _draft_internal_reply message_id={}: {}",
+                    message_id,
+                    exc,
+                )
+                try:
+                    self.gmail.apply_label(message_id, "agent-timed-out")
+                except Exception:
+                    pass
+                return draft_id
             reply_to = sender_email
             reply_subject = self._reply_subject(subject)
             thread_id: str | None = email.get("thread_id") or None
@@ -331,7 +361,7 @@ class ChatAgent:
         """
         user_content = f"Subject: {subject}\n\nBody:\n{body_text[:1000]}"
 
-        response = ollama.chat(
+        response = _ollama_client.chat(
             model=settings.OLLAMA_MODEL,
             options={"temperature": 0.0},
             messages=[
@@ -394,7 +424,7 @@ Requirements:
 - End with a closing and the clinic name placeholder "[Clinic Name]"
 - Return the email body text only"""
 
-        response = ollama.chat(
+        response = _ollama_client.chat(
             model=settings.OLLAMA_MODEL,
             options={"temperature": 0.3},
             messages=[

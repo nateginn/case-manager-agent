@@ -19,11 +19,14 @@ from __future__ import annotations
 import ollama
 from loguru import logger
 
+_ollama_client = ollama.Client(timeout=180)
+
 from config import settings
 from tools.gmail_tool import GmailTool
 from tools.pdf_tool import PdfTool
 from memory.email_store import EmailStore
 from utils import stage_chat_message
+from training.ingest_history import phi_scrub
 
 # Shared clinic system prompt used for every Ollama call in this agent.
 _CLINIC_SYSTEM_PROMPT = (
@@ -61,7 +64,17 @@ class ReferralAgent:
             draft_id = self.process(email)
             return {"status": "draft" if settings.DRAFT_MODE else "processed", "draft_id": draft_id}
         except Exception as exc:
-            logger.exception("ReferralAgent failed on email id={}", email.get("id"))
+            email_id = email.get("id", "")
+            logger.error(
+                "ReferralAgent failed on email id={}: {}",
+                email_id,
+                exc,
+            )
+            if email_id:
+                try:
+                    self.gmail.apply_label(email_id, "agent-timed-out")
+                except Exception:
+                    pass
             return {"status": "error", "error": str(exc)}
 
     # ------------------------------------------------------------------
@@ -191,6 +204,17 @@ class ReferralAgent:
         """
         subject = email.get("subject", "")
         sender = email.get("sender", "")
+        thread_history: list[dict] = email.get("thread_history", [])
+
+        history_block = ""
+        if thread_history:
+            lines = ["--- Prior Conversation History ---"]
+            for msg in thread_history:
+                lines.append(f"[{msg.get('date', '')}] From: {msg.get('sender', '')}")
+                lines.append(phi_scrub(msg.get("body", "")))
+                lines.append("")
+            lines.append("--- End History ---")
+            history_block = "\n".join(lines) + "\n\n"
 
         first_name = referral_fields.get("patient_first_name") or ""
         last_name = referral_fields.get("patient_last_name") or ""
@@ -212,6 +236,7 @@ class ReferralAgent:
             auth_line = "Our records indicate no prior authorization is required for this referral."
 
         user_prompt = f"""\
+{history_block}Current Email:
 Write a professional acknowledgment email replying to a referral received from {provider}.
 
 Context:
@@ -232,7 +257,7 @@ Requirements:
 - End with a closing and the clinic name placeholder "[Clinic Name]"
 - Return the email body text only"""
 
-        response = ollama.chat(
+        response = _ollama_client.chat(
             model=settings.OLLAMA_MODEL,
             options={"temperature": 0.3},
             messages=[

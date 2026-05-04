@@ -13,6 +13,8 @@ import re
 import ollama
 from loguru import logger
 
+_ollama_client = ollama.Client(timeout=180)
+
 try:
     from PyPDF2 import PdfReader
 except ImportError:
@@ -154,7 +156,7 @@ class PdfTool:
             len(pdf_text),
         )
 
-        response = ollama.chat(
+        response = _ollama_client.chat(
             model=settings.OLLAMA_MODEL,
             options={"temperature": 0.1},
             messages=[

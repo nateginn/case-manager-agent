@@ -13,6 +13,10 @@ from typing import Literal
 
 import ollama
 from loguru import logger
+
+# Shared Ollama client with a 180-second request timeout so qwen3:32b thinking
+# loops cannot stall the agent pass indefinitely.
+_ollama_client = ollama.Client(timeout=180)
 from pydantic import BaseModel, Field
 
 from config import settings
@@ -102,7 +106,7 @@ class OrchestratorAgent:
 
         logger.debug("Classifying email id={}", email.get("id"))  # HIPAA: no PHI logged
 
-        response = ollama.chat(
+        response = _ollama_client.chat(
             model=settings.OLLAMA_MODEL,
             options={"temperature": 0.0},
             messages=[
@@ -173,7 +177,31 @@ class OrchestratorAgent:
                 notes="Skipped — already processed by a concurrent agent pass",
             )
 
-        classification = self.classify_email(email)
+        try:
+            classification = self.classify_email(email)
+        except Exception as exc:
+            logger.error(
+                "Ollama error classifying email id={}: {}",
+                email_id,
+                exc,
+            )
+            try:
+                self.gmail.apply_label(email_id, "agent-timed-out")
+            except Exception:
+                pass
+            return ProcessingResult(
+                email_id=email_id,
+                classification="unknown",
+                agent_status="timed_out",
+                notes=f"Ollama timeout or error during classification: {type(exc).__name__}",
+            )
+
+        # Fetch prior thread messages and attach to the email dict so specialist
+        # agents can inject conversation history into their draft prompts.
+        thread_id = email.get("thread_id", "")
+        email["thread_history"] = (
+            self.gmail.fetch_thread(thread_id, email_id) if thread_id else []
+        )
 
         draft_id: str | None = None
         chat_message_staged = False
@@ -212,6 +240,10 @@ class OrchestratorAgent:
                 email_id,
                 classification,
             )
+            try:
+                self.gmail.apply_label(email_id, "agent-timed-out")
+            except Exception:
+                pass
             agent_status = "error"
             notes = f"Exception during processing: {type(exc).__name__}: {exc}"
 

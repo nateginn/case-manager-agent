@@ -72,7 +72,7 @@ def referral_agent_mocked():
         patch("agents.referral_agent.GmailTool") as mock_gmail_cls,
         patch("agents.referral_agent.PdfTool") as mock_pdf_cls,
         patch("agents.referral_agent.EmailStore") as mock_store_cls,
-        patch("agents.referral_agent.ollama") as mock_ollama,
+        patch("agents.referral_agent._ollama_client") as mock_ollama,
     ):
         mock_gmail = MagicMock()
         mock_gmail_cls.return_value = mock_gmail
@@ -184,7 +184,7 @@ def billing_agent_mocked():
     with (
         patch("agents.billing_agent.GmailTool") as mock_gmail_cls,
         patch("agents.billing_agent.EmailStore") as mock_store_cls,
-        patch("agents.billing_agent.ollama") as mock_ollama,
+        patch("agents.billing_agent._ollama_client") as mock_ollama,
     ):
         mock_gmail = MagicMock()
         mock_gmail_cls.return_value = mock_gmail
