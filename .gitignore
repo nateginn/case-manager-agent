@@ -17,6 +17,7 @@ env/
 .env
 credentials.json
 token.json
+assistant_token.json
 
 # Database and vector store
 *.db
@@ -40,3 +41,17 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Runtime state (contains sender addresses / thread state)
+memory/*.json
+
+# Prompt EMR session cookies + UI screenshots (screenshots contain PHI)
+memory/prompt_emr_session.json
+memory/emr_downloads/
+
+# Machine-specific CA bundle
+windows_cacerts.pem
+
+# Training artifacts
+training/audit_report.txt
+.claude/scheduled_tasks.lock

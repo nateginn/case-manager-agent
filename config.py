@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
+from pathlib import Path
 
+from loguru import logger
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,8 +26,72 @@ class Settings(BaseSettings):
     GOOGLE_CHAT_SPACE_BENEFITS: str = ""
     GOOGLE_CHAT_SPACE_BILLING: str = ""
 
+    # Monitoring / alerting assistant mode
+    MONITORING_MODE: bool = False
+    UNANSWERED_THRESHOLD_HOURS: int = 4
+    ALERT_SPACE_ID: str = ""           # Google Chat space for case-manager alerts
+    CASE_MANAGER_EMAIL: str = ""       # sender address used to detect outbound replies
+    ALERT_DEDUPE_WINDOW_HOURS: int = 24
+
+    # Prompt EMR — browser automation
+    PROMPT_EMR_USERNAME: str = ""
+    PROMPT_EMR_PASSWORD: str = ""
+    PROMPT_EMR_BASE_URL: str = "https://go.promptemr.com"
+
+    # Claire two-way email assistant
+    CLAIRE_ENABLED: bool = False
+    CLAIRE_POLL_INTERVAL_SECONDS: int = 45
+    CLAIRE_ALERT_SPACE_ID: str = ""            # Chat space Claire posts to and reads from
+    CLAIRE_ASSISTANT_TOKEN_PATH: str = "assistant_token.json"
+    CLAIRE_REPLY_TIMEOUT_HOURS: int = 4        # hours before pending entry expires
+    CLAIRE_NUDGE_DAYS: int = 2                 # days before a gentle nudge is sent
+    CLAIRE_NOTIFICATION_BATCH_SIZE: int = 3    # max notifications per cycle; remainder queued
+    CLAIRE_GREELEY_SPACE_ID: str = ""          # falls back to GOOGLE_CHAT_SPACE_GREELEY
+    CLAIRE_DENVER_SPACE_ID: str = ""           # falls back to GOOGLE_CHAT_SPACE_DENVER
+    CLAIRE_EMR_LOOKUP_ENABLED: bool = False    # auto-draft replies to visit inquiries via Prompt EMR
+
 
 settings = Settings()
+
+
+# ---------------------------------------------------------------------------
+# Logging — rotating file sink + uvicorn/std-logging bridge
+# ---------------------------------------------------------------------------
+
+_LOG_PATH = Path(__file__).parent / "logs" / "app.log"
+
+
+class _InterceptHandler(logging.Handler):
+    """Route standard-library log records (uvicorn, googleapiclient) into loguru."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+
+
+def setup_logging() -> None:
+    """
+    Add a rotating file sink so logs no longer grow unbounded, and intercept
+    std-logging so uvicorn output lands in the same rotated file.
+
+    HIPAA note: diagnose=False is required — loguru's diagnose mode dumps
+    local variable values into tracebacks, which could include email bodies.
+    """
+    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        str(_LOG_PATH),
+        rotation="10 MB",
+        retention=10,
+        compression="zip",
+        enqueue=True,  # thread-safe across the Claire/orchestrator/uvicorn threads
+        backtrace=False,
+        diagnose=False,
+        level="INFO",
+    )
+    logging.basicConfig(handlers=[_InterceptHandler()], level=logging.INFO, force=True)
 
 
 # ---------------------------------------------------------------------------

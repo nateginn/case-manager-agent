@@ -30,13 +30,17 @@ from pathlib import Path
 import requests as http_requests
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from loguru import logger
 from pydantic import BaseModel
 
-from config import settings, validate_hipaa_posture
+from config import settings, setup_logging, validate_hipaa_posture
+from utils import atomic_write_json
 from agents.orchestrator import OrchestratorAgent, ProcessingResult
+
+setup_logging()
 from agents.chat_agent import ChatAgent
+from agents.monitoring_agent import MonitoringAgent
 
 # ---------------------------------------------------------------------------
 # Staged messages — read directly from file (avoids circular init overhead)
@@ -47,10 +51,7 @@ _STAGED_PATH = Path(__file__).parent / "memory" / "staged_chat_messages.json"
 
 def _write_staged(entries: list[dict]) -> None:
     """Rewrite staged_chat_messages.json with *entries*."""
-    _STAGED_PATH.write_text(
-        json.dumps(entries, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    atomic_write_json(_STAGED_PATH, entries)
 
 
 def _backfill_uuids(entries: list[dict]) -> list[dict]:
@@ -89,6 +90,12 @@ def _read_all_staged() -> list[dict]:
 _poll_thread: threading.Thread | None = None
 _orchestrator: OrchestratorAgent | None = None
 _chat_agent: ChatAgent | None = None
+_monitoring_agent: MonitoringAgent | None = None
+
+_claire_agent = None
+_claire_thread: threading.Thread | None = None
+_claire_lock = threading.Lock()
+_claire_paused: bool = False
 
 # Prevents two manual /agent/run calls from running simultaneously.
 _poll_lock = threading.Lock()
@@ -107,14 +114,27 @@ def _polling_worker(interval: int = 60) -> None:
         time.sleep(interval)
 
 
+def _claire_worker(interval: int = 45) -> None:
+    """Daemon thread body: run one Claire cycle per interval seconds."""
+    logger.info("Claire polling thread started (interval={}s)", interval)
+    while True:
+        if not _claire_paused and _claire_agent is not None:
+            try:
+                _claire_agent.run_cycle()
+            except Exception as exc:
+                logger.error("Claire polling error: {}", exc)
+        time.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _chat_agent, _poll_thread
+    global _orchestrator, _chat_agent, _poll_thread, _monitoring_agent, _claire_agent, _claire_thread
 
     validate_hipaa_posture()
 
     _orchestrator = OrchestratorAgent()
     _chat_agent = ChatAgent()
+    _monitoring_agent = MonitoringAgent()
 
     if settings.ENABLE_POLLING:
         _poll_thread = threading.Thread(
@@ -131,8 +151,22 @@ async def lifespan(app: FastAPI):
             "Use POST /agent/run or set ENABLE_POLLING=true in .env."
         )
 
+    if settings.CLAIRE_ENABLED:
+        from agents.claire_agent import ClaireAgent
+        _claire_agent = ClaireAgent()
+        _claire_thread = threading.Thread(
+            target=_claire_worker,
+            kwargs={"interval": settings.CLAIRE_POLL_INTERVAL_SECONDS},
+            daemon=True,
+            name="claire-poll",
+        )
+        _claire_thread.start()
+        logger.info("Claire assistant started (CLAIRE_ENABLED=true, interval={}s)", settings.CLAIRE_POLL_INTERVAL_SECONDS)
+    else:
+        logger.info("Claire disabled (CLAIRE_ENABLED=false). Set CLAIRE_ENABLED=true in .env to enable.")
+
     yield
-    # Daemon thread stops automatically when the process exits.
+    # Daemon threads stop automatically when the process exits.
 
 
 app = FastAPI(
@@ -1075,6 +1109,124 @@ def chat(request: ChatRequest) -> ChatResponse:
 
 
 # ---------------------------------------------------------------------------
+# POST /agent/monitor — run one monitoring scan pass (no labels, no drafts)
+# ---------------------------------------------------------------------------
+
+def _run_monitor_background() -> None:
+    """Background task: run one monitoring pass, then release the lock."""
+    _job_state["running"] = True
+    try:
+        alerts = _monitoring_agent.scan_for_unanswered()
+        _job_state["last_status"] = {
+            "outcome": "completed",
+            "mode": "monitor",
+            "alerts_sent": len(alerts),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.info("Monitor pass complete: {} alerts sent", len(alerts))
+    except Exception as exc:
+        _job_state["last_status"] = {
+            "outcome": "error",
+            "mode": "monitor",
+            "error": str(exc),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.error("Monitor pass failed: {}", exc)
+    finally:
+        _job_state["running"] = False
+        _poll_lock.release()
+
+
+@app.post("/agent/monitor")
+def run_monitor_pass(background_tasks: BackgroundTasks) -> dict:
+    """
+    Trigger one monitoring scan in the background.  Scans unread inbox for
+    unanswered work emails older than UNANSWERED_THRESHOLD_HOURS and sends
+    Google Chat alerts.  No emails are labelled or modified.
+    Returns 409 if a pass is already running.
+    """
+    if not _poll_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Agent pass already running")
+    logger.info("Monitor pass triggered via POST /agent/monitor")
+    background_tasks.add_task(_run_monitor_background)
+    return {"status": "started", "mode": "monitor"}
+
+
+# ---------------------------------------------------------------------------
+# POST /agent/learn — read-only learn pass over recent inbox threads
+# ---------------------------------------------------------------------------
+
+def _run_learn_background(max_threads: int) -> None:
+    """Background task: run the learn pass, then release the lock."""
+    _job_state["running"] = True
+    try:
+        result = _monitoring_agent.learn_from_threads(max_threads=max_threads)
+        _job_state["last_status"] = {
+            "outcome": "completed",
+            "mode": "learn",
+            **result,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.info(
+            "Learn pass complete: {} threads analysed, {} without reply",
+            result["threads_analysed"],
+            result["without_reply"],
+        )
+    except Exception as exc:
+        _job_state["last_status"] = {
+            "outcome": "error",
+            "mode": "learn",
+            "error": str(exc),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.error("Learn pass failed: {}", exc)
+    finally:
+        _job_state["running"] = False
+        _poll_lock.release()
+
+
+@app.post("/agent/learn")
+def run_learn_pass(background_tasks: BackgroundTasks, max_threads: int = 100) -> dict:
+    """
+    Trigger a read-only learn pass in the background.  Fetches up to
+    *max_threads* recent inbox threads, analyses reply patterns, and writes
+    a report to memory/learn_report.json.  No emails are labelled or modified.
+    Returns 409 if a pass is already running.
+    """
+    if not _poll_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Agent pass already running")
+    logger.info(
+        "Learn pass triggered via POST /agent/learn max_threads={}", max_threads
+    )
+    background_tasks.add_task(_run_learn_background, max_threads)
+    return {"status": "started", "mode": "learn", "max_threads": max_threads}
+
+
+# ---------------------------------------------------------------------------
+# GET /agent/alerts — list recent monitoring alerts sent
+# ---------------------------------------------------------------------------
+
+@app.get("/agent/alerts")
+def list_alerts(limit: int = 50) -> list[dict]:
+    """
+    Return the most recent monitoring alerts from memory/sent_alerts.json,
+    newest first.
+    """
+    from agents.monitoring_agent import _ALERTS_PATH
+
+    if not _ALERTS_PATH.exists():
+        return []
+    try:
+        data = json.loads(_ALERTS_PATH.read_text(encoding="utf-8"))
+        alerts = data if isinstance(data, list) else []
+        alerts.sort(key=lambda a: a.get("alerted_at", ""), reverse=True)
+        return alerts[:limit]
+    except Exception as exc:
+        logger.error("list_alerts failed: {}", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
 # GET /health
 # ---------------------------------------------------------------------------
 
@@ -1099,7 +1251,94 @@ def health() -> dict:
         "draft_mode": settings.DRAFT_MODE,
         "polling_enabled": settings.ENABLE_POLLING,
         "polling_active": _poll_thread is not None and _poll_thread.is_alive(),
+        "claire_enabled": settings.CLAIRE_ENABLED,
+        "claire_active": _claire_thread is not None and _claire_thread.is_alive() and not _claire_paused,
+        "claire_paused": _claire_paused,
     }
+
+
+# ---------------------------------------------------------------------------
+# Claire endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/claire/run")
+async def claire_run(background_tasks: BackgroundTasks):
+    """Trigger one manual Claire cycle immediately."""
+    if _claire_agent is None:
+        raise HTTPException(status_code=503, detail="Claire is not enabled. Set CLAIRE_ENABLED=true in .env.")
+
+    def _run():
+        with _claire_lock:
+            result = _claire_agent.run_cycle()
+            logger.info("Manual Claire cycle complete: {}", result)
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "mode": "claire"}
+
+
+@app.get("/claire/state")
+async def claire_state():
+    """Return the current claire_state.json content."""
+    state_path = Path("memory/claire_state.json")
+    if not state_path.exists():
+        return {"emails": {}, "junk_batches": {}}
+    try:
+        return JSONResponse(content=json.loads(state_path.read_text(encoding="utf-8")))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read Claire state: {exc}")
+
+
+@app.post("/claire/expire")
+async def claire_expire():
+    """Manually expire all pending Claire entries (useful for testing and cleanup)."""
+    if _claire_agent is None:
+        raise HTTPException(status_code=503, detail="Claire is not enabled.")
+    expired = _claire_agent._expire_stale_entries()  # noqa: SLF001
+    return {"expired": expired}
+
+
+@app.post("/timeouts/reset")
+async def timeouts_reset():
+    """
+    Clear the failed-attempt tracker (memory/timeout_retries.json) so emails
+    stuck in retry cooldown or given up on are re-attempted on the next poll.
+    Remove the 'agent-processed' label in Gmail for parked emails if needed.
+    """
+    from agents.orchestrator import _RETRY_STATE_PATH  # noqa: PLC0415
+
+    cleared = 0
+    if _RETRY_STATE_PATH.exists():
+        try:
+            data = json.loads(_RETRY_STATE_PATH.read_text(encoding="utf-8"))
+            cleared = len(data) if isinstance(data, dict) else 0
+        except (json.JSONDecodeError, OSError):
+            pass
+        atomic_write_json(_RETRY_STATE_PATH, {})
+    logger.info("Timeout retry state reset ({} entries cleared)", cleared)
+    return {"status": "reset", "entries_cleared": cleared}
+
+
+@app.post("/claire/pause")
+async def claire_pause():
+    """Pause Claire's background polling without stopping the server."""
+    global _claire_paused
+    if _claire_agent is None:
+        raise HTTPException(status_code=503, detail="Claire is not enabled.")
+    _claire_paused = True
+    logger.info("Claire polling paused via POST /claire/pause")
+    return {"status": "paused", "claire_active": False}
+
+
+@app.post("/claire/resume")
+async def claire_resume():
+    """Resume Claire's background polling."""
+    global _claire_paused
+    if _claire_agent is None:
+        raise HTTPException(status_code=503, detail="Claire is not enabled.")
+    _claire_paused = False
+    logger.info("Claire polling resumed via POST /claire/resume")
+    return {"status": "resumed", "claire_active": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1145,4 +1384,6 @@ if __name__ == "__main__":
             settings.DRAFT_MODE,
             settings.ENABLE_POLLING,
         )
-        uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+        # log_config=None lets uvicorn inherit root logging, which is
+        # intercepted into the rotating loguru sink by setup_logging().
+        uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_config=None)

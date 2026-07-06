@@ -30,15 +30,124 @@ See [HIPAA_POSTURE.md](HIPAA_POSTURE.md) for a full data-flow audit, OAuth scope
 
 ```
 main.py  (FastAPI + approval dashboard at http://localhost:8000)
-  └── OrchestratorAgent
-        ├── ReferralAgent   → GmailTool, PdfTool, EmailStore
-        ├── BillingAgent    → GmailTool, EmailStore
-        └── ChatAgent       → staged-message queue manager
+  ├── OrchestratorAgent
+  │     ├── ReferralAgent   → GmailTool, PdfTool, EmailStore
+  │     ├── BillingAgent    → GmailTool, EmailStore
+  │     └── ChatAgent       → staged-message queue manager
+  └── ClaireAgent  (two-way Google Chat assistant — see below)
+        ├── GmailTool       (reads casemanager.art@gmail.com inbox)
+        └── GoogleChatTool  (sends/reads "CMagent - CM - Nate" space
+                             appearing as cm.assistant.art@gmail.com)
 
-memory/EmailStore      ←→  ChromaDB  (./chroma_db — local disk)
+memory/EmailStore       ←→  ChromaDB  (./chroma_db — local disk)
+memory/claire_state.json    (Claire email notification + queue tracking)
 tools/PromptEmrTool         (stub — implement for your EMR system)
 training/HistoryIngester    (one-time bulk Gmail ingestion)
 ```
+
+---
+
+## Claire — Two-Way Email Assistant
+
+Claire watches the `casemanager.art@gmail.com` inbox and sends batched notification cards to the **"CMagent - CM - Nate"** Google Chat space, appearing as `cm.assistant.art@gmail.com`. The case manager replies with commands in Chat; Claire executes them.
+
+> Previously named "Jarvis". All config vars and state files use the `CLAIRE_` prefix.
+
+### How it works
+
+1. **Scan** — Every 45 seconds Claire fetches the 50 most recent inbox emails and deduplicates by thread.
+2. **Filter** — Three layers:
+   - Automated/no-reply senders → always skipped
+   - Trusted sender domains (@marrick.com, @movedocs.com, @healthsps.com, etc.) → always work
+   - Work subject keywords (PAV, EOB, authoriz, patient, billing, etc.) → always work
+   - GLM 4.7 Flash classifies ambiguous senders/subjects (defaults to "work" when uncertain)
+3. **Notify (batched)** — Up to 10 cards posted per cycle; the rest queue silently.
+   ```
+   📬 Sender Name <email>
+   Subject: ... (N messages in thread)
+
+   [Ollama thread summary]
+   💡 Suggested: forward to Greeley
+
+   → Reply: delete | forward greeley | forward denver | got it | waiting
+   ```
+   When the queue has more, a status card appears: "📬 Showing 10 of 36 emails. Say *next 10* to see 10 more."
+4. **Reply** — The case manager types a command in the Chat thread.
+5. **Execute** — Claire parses the command and acts:
+   - `delete` → two-step confirmation (`confirm` to proceed, `cancel` to abort)
+   - `forward greeley` → posts summary to the Greeley receptionist space
+   - `forward denver` → posts summary to the Denver space
+   - `got it` / `thanks` / `ok` → marks as reviewed
+   - `waiting` → marks as monitoring (no action, suppresses nudges)
+   - `next 10` → delivers next batch from queue
+   - `new day` / `clean start` → deletes all Chat messages, wipes state, starts fresh
+
+### Junk handling
+
+Emails that pass no filter and are classified as "junk" by GLM are batched into a single card:
+```
+🗑️ 3 likely junk emails found:
+  • Subject — sender
+  • ...
+Reply "trash all" to move them to Trash, or "skip" to leave them.
+```
+- `trash all` → moves all to Gmail Trash
+- `skip` → leaves in inbox AND removes them from the junk-seen list so they re-enter the work queue next cycle
+
+### Accounts
+
+| Purpose | Account | Token file |
+|---------|---------|-----------|
+| Read Gmail inbox | `casemanager.art@gmail.com` | `token.json` |
+| Send/read Chat alerts | `cm.assistant.art@gmail.com` | `assistant_token.json` |
+
+Both use the same `credentials.json` / Google Cloud project. The assistant token needs Chat scope only — no Gmail access.
+
+### Setup (one-time per machine)
+
+1. Ensure `cm.assistant.art@gmail.com` is a member of your "CMagent - CM - Nate" Chat space.
+2. Enable the Google Chat API in Google Cloud Console and configure a Chat App (any name, `https://localhost` as endpoint).
+3. Run the assistant OAuth flow to create `assistant_token.json`:
+   ```powershell
+   cd D:\Dev\dual-agent-core\case-manager-agent-dev
+   .\.venv\Scripts\python.exe tools/auth_assistant.py
+   ```
+   Sign in as `cm.assistant.art@gmail.com` when the browser opens.
+
+### Configuration (`.env`)
+
+```ini
+CLAIRE_ENABLED=true
+CLAIRE_POLL_INTERVAL_SECONDS=45
+CLAIRE_ALERT_SPACE_ID=AAQABJJCGpA         # Chat space ID from the space URL
+CLAIRE_ASSISTANT_TOKEN_PATH=assistant_token.json
+CLAIRE_REPLY_TIMEOUT_HOURS=4
+CLAIRE_NUDGE_DAYS=2
+CLAIRE_NOTIFICATION_BATCH_SIZE=10
+
+# Model — glm-4.7-flash is faster and cheaper than qwen3 for classification
+OLLAMA_MODEL=glm-4.7-flash:latest
+OLLAMA_LIGHT_MODEL=glm-4.7-flash:latest
+```
+
+### Claire API endpoints
+
+| Endpoint | Method | Description |
+|---------|--------|-------------|
+| `/claire/state` | GET | Current email notification state (pending/resolved/expired) |
+| `/claire/run` | POST | Trigger one manual Claire cycle immediately |
+| `/claire/expire` | POST | Expire all pending entries (testing/cleanup) |
+
+### Utility scripts
+
+- `cleanup_chat.py` — bulk-delete all messages from the Claire alert space (supports `--dry-run`)
+
+### Security notes
+
+- **Delete requires two-step confirmation.** Claire never deletes without a `confirm` reply.
+- Ollama's junk-classifier fallback cannot return `delete` — destructive actions require an explicit human keyword match.
+- `assistant_token.json` must NOT be committed to git (it's in `.gitignore`).
+- All LLM inference stays local via Ollama. PHI is never logged or sent externally.
 
 ---
 
@@ -136,11 +245,14 @@ classification and the date range covered.
 
 ```bash
 python main.py
-# or with auto-reload during development
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# or bind to localhost only (recommended)
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
 Every startup runs `validate_hipaa_posture()` and prints the result.
+
+Logs are written to `logs/app.log` with automatic rotation (10 MB per file,
+10 files kept, zipped) — do not redirect stdout to a log file.
 
 ### 7. Open the approval dashboard
 

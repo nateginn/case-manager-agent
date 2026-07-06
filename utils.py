@@ -1,19 +1,113 @@
 """
 Shared utilities — staging helper used by BillingAgent, ReferralAgent, and
 ChatAgent so all three write consistent JSON entries to
-memory/staged_chat_messages.json.
+memory/staged_chat_messages.json, plus atomic-JSON-write and bounded-retry
+helpers shared across agents and tools.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
 
 from loguru import logger
 
 _STAGED_MESSAGES_PATH = Path(__file__).parent / "memory" / "staged_chat_messages.json"
+
+# ---------------------------------------------------------------------------
+# Atomic JSON persistence
+# ---------------------------------------------------------------------------
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    """
+    Write *data* as JSON to *path* via write-temp-then-rename so a crash
+    mid-write can never leave a truncated/corrupt file behind.
+
+    The temp file lives in the same directory as *path* (same volume), which
+    makes ``os.replace`` atomic on both Windows and POSIX. Raises on failure —
+    callers decide whether to swallow.
+    """
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2, ensure_ascii=False))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Bounded retry for transient API errors
+# ---------------------------------------------------------------------------
+
+_TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+
+# httpx exception class names — matched by name so utils.py never needs a
+# hard httpx import (it arrives transitively via the ollama package).
+_TRANSIENT_EXC_NAMES = {
+    "ConnectError",
+    "ConnectTimeout",
+    "ReadTimeout",
+    "WriteTimeout",
+    "PoolTimeout",
+    "TimeoutException",
+}
+
+
+def is_transient_error(exc: Exception) -> bool:
+    """Return True for errors worth retrying (rate limits, 5xx, network blips)."""
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        try:
+            return int(status) in _TRANSIENT_HTTP_STATUSES
+        except (TypeError, ValueError):
+            pass
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    return type(exc).__name__ in _TRANSIENT_EXC_NAMES
+
+
+def retry_call(
+    fn: Callable[[], Any],
+    *,
+    retries: int = 2,
+    base_delay: float = 1.0,
+    retry_on: Callable[[Exception], bool] = is_transient_error,
+    label: str = "",
+) -> Any:
+    """
+    Call *fn* with up to *retries* additional attempts on transient errors,
+    using exponential backoff (base_delay * 2**attempt).
+
+    PHI note: logs only the label, attempt number, and exception type —
+    never arguments or payloads.
+    """
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt >= retries or not retry_on(exc):
+                raise
+            delay = base_delay * (2 ** attempt)
+            attempt += 1
+            logger.warning(
+                "retry_call[{}]: {} on attempt {}/{} — retrying in {:.1f}s",
+                label or "unnamed", type(exc).__name__, attempt, retries + 1, delay,
+            )
+            time.sleep(delay)
 
 
 def stage_chat_message(
@@ -76,9 +170,13 @@ def stage_chat_message(
     existing.append(entry)
 
     try:
-        _STAGED_MESSAGES_PATH.write_text(
-            json.dumps(existing, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        # One bounded retry mitigates transient write failures (e.g. AV scan
+        # holding the file); full durability is out of scope for a JSON queue.
+        retry_call(
+            lambda: atomic_write_json(_STAGED_MESSAGES_PATH, existing),
+            retries=1,
+            retry_on=lambda exc: isinstance(exc, OSError),
+            label="stage_chat_message.write",
         )
         logger.debug(
             "Staged chat message id={} type={} status={}",

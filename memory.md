@@ -5,7 +5,7 @@ A local, HIPAA-compliant AI agent system for a chiropractic/PT/massage/acupunctu
 Processes incoming emails, drafts replies and internal Google Chat messages, routes referrals and
 billing inquiries. Human-in-the-loop approval via a local FastAPI dashboard. No PHI leaves the machine.
 
-## Current status: BUILD COMPLETE — Tasks B and C done, dashboard queue management added, ready for live pass
+## Current status: CLAIRE LIVE — hardened 2026-07-03 (learned sender lists, retries, atomic state, log rotation); changes UNCOMMITTED — see "Current state / handoff" at the bottom of this file
 
 ## Tech stack
 - Python 3.11, FastAPI, ChromaDB, Ollama
@@ -14,14 +14,14 @@ billing inquiries. Human-in-the-loop approval via a local FastAPI dashboard. No 
 - IDE: Windsurf
 
 ## Ollama models (all downloaded)
+- glm-4.7-flash:latest — **active model for Claire** (OLLAMA_MODEL + OLLAMA_LIGHT_MODEL, use `think=False`)
 - qwen3:32b — primary model (ReferralAgent, BillingAgent)
 - qwen3:4b — light model (ChatAgent, Orchestrator classifier)
 - granite3.2-vision — OCR fallback for scanned fax PDFs
 - bge-m3 — embeddings for ChromaDB
-- glm-4.7-flash — keep, used by another project
 
 ## Project location
-C:\Users\growy\Dev_projects\case-manager-agent\
+D:\Dev\dual-agent-core\case-manager-agent-dev\  (own git repo; remote github.com/nateginn/case-manager-agent)
 
 ## Agent architecture
 - OrchestratorAgent — classifies emails, routes to specialists, polls Gmail
@@ -56,7 +56,13 @@ C:\Users\growy\Dev_projects\case-manager-agent\
 
 ## Server Launch Command (Windows)
 ```
-$env:PYTHONUTF8=1; python -m uvicorn main:app --host 127.0.0.1 --port 8000
+$env:PYTHONUTF8=1; .venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+Do NOT redirect stdout to a log file — logging now goes to `logs/app.log` via a
+rotating loguru sink (10 MB × 10, zipped), configured in `config.setup_logging()`.
+For a detached launch from Git Bash:
+```
+PYTHONUTF8=1 REQUESTS_CA_BUNDLE="$(pwd)/windows_cacerts.pem" nohup .venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000 >/dev/null 2>&1 &
 ```
 (no --reload outside of active development)
 Note: `PYTHONUTF8=1 python -m ...` bash syntax does NOT work in PowerShell — use `$env:` syntax above.
@@ -236,3 +242,228 @@ Note: `PYTHONUTF8=1 python -m ...` bash syntax does NOT work in PowerShell — u
 - API key auth on /agent/run (prerequisite for any external trigger)
 - PromptEmrTool: implement when Prompt EMR API access is available
 - See ROUTINES_CONSIDERATION.md for Claude Code Routines scheduling option
+
+---
+
+## Sessions: 2026-05 through 2026-06-25 — Claire Two-Way Email Assistant
+
+### Summary
+Jarvis was renamed **Claire** throughout the codebase. A complete two-way Gmail→Chat
+assistant now runs live in production. Major architectural additions, several bugs
+found and fixed across multiple sessions.
+
+### Agent rename: Jarvis → Claire
+- `agents/jarvis_agent.py` → `agents/claire_agent.py`
+- All env vars changed from `JARVIS_*` to `CLAIRE_*`
+- State file: `memory/claire_state.json`
+- Codename "claire" used everywhere in logs and Chat messages
+
+### Claire architecture (agents/claire_agent.py)
+- Runs on a 45-second poll loop (`CLAIRE_POLL_INTERVAL_SECONDS=45`)
+- Two phases per cycle: `_poll_chat_replies()` then `_scan_new_emails()`
+- State persisted to `memory/claire_state.json`; guarded by `threading.Lock`
+- Two Google accounts:
+  - `casemanager.art@gmail.com` (token.json) — reads Gmail inbox
+  - `cm.assistant.art@gmail.com` (assistant_token.json) — sends/reads Chat alerts
+
+### Batch notification queue (major feature)
+- `CLAIRE_NOTIFICATION_BATCH_SIZE=10` — first 10 notifications sent immediately
+- Remaining threads serialized to `state["notification_queue"]`
+- Queue drains ONLY via explicit "next 10" / "next batch" / "more" user command
+- `queued_thread_ids` set built from queue each cycle — prevents re-scanning queued threads
+- Summary card: "📬 Showing 10 of 36 emails. Say *next 10* to see 10 more."
+
+### Self-message filtering (prevents Claire triggering herself)
+- `_processed_chat_names`: set of message resource names sent by Claire this session
+- `_CLAIRE_MSG_PREFIXES`: tuple of known prefixes for cross-restart protection
+- `_send_tracked()`: wrapper that adds returned message name to `_processed_chat_names`
+- `is_own` check: sender_email == bot email OR sender_type == BOT OR startswith prefix
+- All status/system messages sent via `_send_tracked()` (not raw `send_message_full`)
+
+### Junk email detection (_is_junk)
+Three-layer approach (fastest/most reliable first):
+1. **Automated sender check**: `_NOREPLY_RE` regex on sender — always skip, never classify
+2. **Trusted domain pre-filter**: `_TRUSTED_SENDER_RE` — @marrick.com, @movedocs.com,
+   @healthsps.com, @medrisknet.com, @medhub.health, @provepartners.com, @zocdoc.com,
+   @marrickbilling.com → immediately "work", no LLM call
+3. **Work subject pre-filter**: `_WORK_SUBJECT_RE` — PAV, EOB, authoriz, scheduling,
+   patient, billing, insurance, referral, DOB, DOI, urgent, script, dates, etc. → "work"
+4. **GLM fallback** (ambiguous only): prompt asks work vs junk, `think=False`,
+   `num_predict=5` — defaults to "work" when uncertain ("only reply junk if clearly confident")
+
+### seen_junk_threads — prevents junk re-classification each cycle
+- `state["seen_junk_threads"]`: list of thread_ids classified as junk
+- Loaded each cycle; threads in set are silently skipped (no LLM call)
+- When new junk found, thread_id added to set; persisted after scan
+- **"skip" on junk batch card** removes those thread_ids from `seen_junk_threads`
+  so they re-enter the work queue next cycle
+- Wiped by "new day" command
+
+### New Day command ("new day" / "clean start" / "fresh start" / "start fresh")
+- Calls `google_chat_tool.delete_all_messages()` (paginates, 0.15s delay per delete)
+- Wipes state to `{"emails": {}, "junk_batches": {}, "notification_queue": [], "seen_junk_threads": []}`
+- Clears `_processed_chat_names` in memory
+- Sends "🌅 Fresh start — N messages cleared. Claire is watching your inbox."
+- Next cycle delivers fresh first 10 from inbox
+
+### cleanup_chat.py — standalone bulk-delete script
+- `python cleanup_chat.py --dry-run` to preview
+- `python cleanup_chat.py` to actually delete
+- Defaults to CLAIRE_ALERT_SPACE_ID; Denver/Greeley return 403 (assistant not a member — expected)
+- Uses `assistant_token.json` (CHAT_ONLY_SCOPES)
+
+### Bugs found and fixed
+1. **Queue auto-drain bug**: `_scan_new_emails` only checked `state["emails"]` to skip threads,
+   not `state["notification_queue"]`. Queued threads re-scanned every 45s, delivering
+   10 more cards automatically. Fixed by building `queued_thread_ids` set from queue
+   at scan time and skipping any thread_id in that set.
+
+2. **Self-triggering "next 10" bug**: Claire's own "📬 Showing 10 of 25..." message
+   matched the "more"/"next 10" keywords in `_poll_chat_replies`, triggering automatic
+   batch delivery. Fixed via `_send_tracked()` + `_CLAIRE_MSG_PREFIXES` prefix check.
+
+3. **Junk re-classification trickle**: Junk emails never tracked in state, so GLM
+   re-evaluated them every 45 seconds. If it flipped to "work", a new card appeared.
+   Fixed by `seen_junk_threads` in state (see above).
+
+4. **Junk false positives**: Work emails from clinic senders misclassified as junk
+   by GLM. Fixed by adding trusted domain + work subject keyword pre-filters and
+   strengthening the GLM prompt to "default to work when uncertain".
+
+### GLM model notes
+- All Claire LLM calls use `think=False` — GLM 4.7 Flash returns content in `response` field
+- Classification calls: `num_predict=5` (single-word answer)
+- Summary calls: `num_predict=120`
+- Suggested action calls: `num_predict=10`
+- Do NOT use `thinking=False` (wrong param) — use `think=False` in generate() options
+
+### Current .env for Claire
+```ini
+OLLAMA_MODEL=glm-4.7-flash:latest
+OLLAMA_LIGHT_MODEL=glm-4.7-flash:latest
+CLAIRE_ENABLED=true
+CLAIRE_POLL_INTERVAL_SECONDS=45
+CLAIRE_ALERT_SPACE_ID=AAQABJJCGpA
+CLAIRE_ASSISTANT_TOKEN_PATH=assistant_token.json
+CLAIRE_REPLY_TIMEOUT_HOURS=4
+CLAIRE_NUDGE_DAYS=2
+CLAIRE_NOTIFICATION_BATCH_SIZE=10
+```
+
+### Known issues / open items
+1. **Gmail API overhead**: fetches 50 full email details every 45 seconds regardless
+   of inbox changes (~4000+ calls/hour). A message-ID cache or Gmail history API
+   would reduce this significantly. Not urgent but worth doing.
+2. **Junk batch "skip" flow**: When user skips a junk batch, those threads re-enter
+   normal classification next cycle. With the improved prompt they should pass as
+   "work". But they won't be queued — they'll be sent immediately in next cycle's
+   batch (up to 10 slots available). This is correct behavior.
+3. **seen_junk_threads grows indefinitely**: Until "new day" is run, the list grows
+   one entry per unique junk thread. No practical problem for a clinic inbox size.
+   Could be pruned against current inbox if needed.
+
+### Planned next steps
+1. **Tune trusted domain list**: As new work email senders are identified (law firms,
+   medical groups, insurers), add their domains to `_TRUSTED_SENDER_RE` in claire_agent.py
+2. **Tune work subject regex**: Add subjects that GLM keeps misclassifying
+3. **Gmail history API**: Replace full 50-email fetch with incremental `history.list`
+   using a saved `historyId` — would eliminate ~95% of Gmail API calls
+4. **"not junk" command**: Let user reply to a junk batch with "not junk" as an
+   alternative to "skip" — clearer semantics, same effect
+5. **Reply timeout handling**: Threads in "waiting" status that never get a reply
+   currently expire after CLAIRE_REPLY_TIMEOUT_HOURS. Consider adding a "remind me
+   tomorrow" command that extends the timeout.
+
+---
+
+## Session: 2026-07-03 — Accuracy + Reliability hardening (Claude Code)
+
+### What changed
+1. **Learned sender lists** (`agents/sender_lists.py`, data in
+   `memory/claire_learned_senders.json`, human-editable JSON):
+   - "trash all" on a junk batch → senders blocklisted (address always;
+     domain too unless free-mail like gmail.com)
+   - "skip" → senders allowlisted (addresses only — weaker signal)
+   - Consulted FIRST in `_is_junk()` (before trusted-domain regex and GLM);
+     loaded once per scan cycle. Latest decision wins; allow beats block at
+     equal specificity. Claire confirms learning in her reply.
+2. **Self-message filtering by message ID**: Claire now persists the resource
+   names of every Chat message she sends (`sent_message_names` in
+   claire_state.json, capped 500) and seeds the in-memory set on startup.
+   Prefix check (`_CLAIRE_MSG_PREFIXES`) is now a last-resort fallback used
+   only when the API returns no sender identity — user messages starting
+   with "Done —" etc. are no longer swallowed after a restart. The
+   `"→ Reply:"` / `"💡 Suggested:"` substring checks were removed.
+3. **Bounded retries** (`utils.retry_call`, transient = 429/5xx/timeouts):
+   - Gmail tool: list/get/modify/trash wrapped (retries=2, backoff)
+   - Chat tool: send/reply/list wrapped (retries=2)
+   - Ollama: classify retries=2, Claire light-model calls retries=1
+4. **Bounded re-attempts for failed emails** (`memory/timeout_retries.json`):
+   - Classification failure: retried up to MAX_TIMEOUT_RETRIES=3 with a
+     15-min cooldown between polls, then parked (agent-processed + label)
+   - Agent-stage failure: previously parked forever after ONE failure — now
+     returns `error_will_retry` and is retried up to 3 attempts too
+   - Success clears bookkeeping and removes the agent-timed-out label
+   - Manual reset: `POST /timeouts/reset`
+5. **Atomic state writes** (`utils.atomic_write_json`, temp+os.replace):
+   claire_state.json, staged_chat_messages.json, timeout_retries.json —
+   a crash mid-write can no longer corrupt state.
+6. **Log rotation** (`config.setup_logging()`): loguru sink at logs/app.log,
+   10 MB rotation, keep 10, zip compression, diagnose=False (HIPAA — no
+   local-var dumps). Uvicorn std-logging intercepted into the same sink
+   (`log_config=None`). Stop redirecting stdout to uvicorn*.log.
+7. `assistant_token.json` added to .gitignore; `GmailTool.remove_label()` added.
+
+### Tests
+- 101 passing (was 84): new tests/test_retry.py, tests/test_sender_lists.py
+- conftest.py now isolates timeout_retries.json to tmp_path (autouse fixture)
+- test_agent_exception_sets_error_status updated for retry semantics
+
+### Verification still to do live (needs Ollama + real spaces)
+- Reply "trash all"/"skip" to a junk batch → check claire_learned_senders.json
+- Restart server mid-conversation, send a message starting with "Done —" →
+  Claire should respond, not swallow it
+- Confirm logs/app.log rotates (server must be started WITHOUT shell
+  redirection to old uvicorn.log files)
+
+---
+
+## Current state / handoff — 2026-07-03 21:10 (for the next Claude Code instance)
+
+### Server
+- RUNNING detached on 127.0.0.1:8000 (started 2026-07-03 ~21:03, PID 56704 at
+  launch — verify with `netstat -ano | findstr :8000`). Health endpoint OK,
+  Claire active (45s cycle), Ollama reachable, draft mode on.
+- Logs: `logs/app.log` (rotating). The old `uvicorn*.log` files in the repo
+  root are dead — no longer written to; safe to delete after user confirms.
+
+### Uncommitted work (IMPORTANT)
+All of the 2026-07-03 hardening (see session entry above) is UNCOMMITTED in
+this repo. Modified: .gitignore, README.md, config.py, main.py, utils.py,
+agents/orchestrator.py, tools/gmail_tool.py, tools/google_chat_tool.py,
+tests/conftest.py, tests/test_classification.py, memory.md.
+Untracked (never committed — includes the whole Claire feature, predating
+this session): agents/claire_agent.py, agents/jarvis_agent.py,
+agents/monitoring_agent.py, agents/sender_lists.py, tools/auth_assistant.py,
+CLAUDE.md, ROUTINES_CONSIDERATION.md, cleanup_chat.py, tests/test_retry.py,
+tests/test_sender_lists.py, .claude/, test_ollama.py, test_thread.py, and
+memory/*.json runtime state files (claire_state, jarvis_state, sent_alerts,
+staged_chat_messages, learn_report, timeout_retries — consider gitignoring
+the runtime ones rather than committing them).
+User wants to verify live behavior before committing — ASK before committing.
+
+### Verification checklist (pending live confirmation by user)
+1. Junk learning: reply "trash all" to a junk batch card → senders should
+   appear in memory/claire_learned_senders.json blocklist and Claire's reply
+   should mention "Learned". Reply "skip" → allowlist.
+2. Self-message fix: after any restart, a user message starting with "Done —"
+   or "📬" must get a response (previously swallowed by prefix filter).
+3. Retry/park: memory/timeout_retries.json tracks failed emails (max 3
+   attempts, 15-min cooldown). Manual reset: POST /timeouts/reset.
+4. Test suite: 101 passing as of 2026-07-03 (`.venv\Scripts\python.exe -m pytest tests/`).
+
+### Known follow-ups (not started, in priority order from the 2026-07-03 review)
+1. Gmail History API incremental sync (biggest efficiency win, ~95% fewer API calls)
+2. Remove legacy agents/jarvis_agent.py (509 lines, superseded by Claire) +
+   memory/jarvis_state.json — DELETION, so ask user first
+3. Integration tests with mocked Google APIs; PHI scrub gaps (patient names, MRNs)

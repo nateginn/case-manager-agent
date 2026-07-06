@@ -8,7 +8,10 @@ Body content is never written to logs.
 
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
 
 import ollama
@@ -21,9 +24,41 @@ from pydantic import BaseModel, Field
 
 from config import settings
 from tools.gmail_tool import GmailTool
+from utils import atomic_write_json, retry_call
 from .referral_agent import ReferralAgent
 from .billing_agent import BillingAgent
 from .chat_agent import ChatAgent
+
+# ---------------------------------------------------------------------------
+# Bounded re-attempt tracking for failed/timed-out emails
+# ---------------------------------------------------------------------------
+
+_RETRY_STATE_PATH = Path(__file__).parent.parent / "memory" / "timeout_retries.json"
+
+# After this many failed processing attempts the email is parked
+# (agent-processed) so the poll loop stops returning it.
+MAX_TIMEOUT_RETRIES = 3
+# Minimum wait between re-attempts so a down Ollama isn't hammered every poll.
+RETRY_COOLDOWN_MINUTES = 15
+
+
+def _load_retry_state() -> dict:
+    if not _RETRY_STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(_RETRY_STATE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Could not read timeout_retries.json: {}", exc)
+        return {}
+
+
+def _save_retry_state(state: dict) -> None:
+    try:
+        _RETRY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(_RETRY_STATE_PATH, state)
+    except OSError as exc:
+        logger.warning("Could not write timeout_retries.json: {}", exc)
 
 # Valid classification categories.
 Category = Literal["referral", "billing", "internal", "unknown"]
@@ -106,13 +141,18 @@ class OrchestratorAgent:
 
         logger.debug("Classifying email id={}", email.get("id"))  # HIPAA: no PHI logged
 
-        response = _ollama_client.chat(
-            model=settings.OLLAMA_MODEL,
-            options={"temperature": 0.0},
-            messages=[
-                {"role": "system", "content": _CLASSIFICATION_SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
+        # Bounded retry on transient failures. Worst case with the 180s client
+        # timeout is ~9 minutes across 3 attempts — acceptable for a background loop.
+        response = retry_call(
+            lambda: _ollama_client.chat(
+                model=settings.OLLAMA_MODEL,
+                options={"temperature": 0.0},
+                messages=[
+                    {"role": "system", "content": _CLASSIFICATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+            ),
+            retries=2, base_delay=2.0, label="ollama.classify",
         )
 
         raw: str = response["message"]["content"].strip().lower()
@@ -189,11 +229,25 @@ class OrchestratorAgent:
                 self.gmail.apply_label(email_id, "agent-timed-out")
             except Exception:
                 pass
+            attempts = self._record_failed_attempt(email_id)
+            if attempts >= MAX_TIMEOUT_RETRIES:
+                # Park the email so the poll query stops returning it; the
+                # agent-timed-out label stays on it for manual review.
+                logger.warning(
+                    "Giving up on email id={} after {} failed attempts", email_id, attempts
+                )
+                try:
+                    self.gmail.mark_as_processed(email_id)
+                except Exception:
+                    pass
             return ProcessingResult(
                 email_id=email_id,
                 classification="unknown",
                 agent_status="timed_out",
-                notes=f"Ollama timeout or error during classification: {type(exc).__name__}",
+                notes=(
+                    f"Ollama timeout or error during classification: {type(exc).__name__} "
+                    f"(attempt {attempts}/{MAX_TIMEOUT_RETRIES})"
+                ),
             )
 
         # Fetch prior thread messages and attach to the email dict so specialist
@@ -244,8 +298,24 @@ class OrchestratorAgent:
                 self.gmail.apply_label(email_id, "agent-timed-out")
             except Exception:
                 pass
+            attempts = self._record_failed_attempt(email_id)
+            if attempts < MAX_TIMEOUT_RETRIES:
+                # Leave the email unmarked so the next poll (after the cooldown)
+                # retries it instead of parking it forever.
+                return ProcessingResult(
+                    email_id=email_id,
+                    classification=classification,
+                    agent_status="error_will_retry",
+                    notes=(
+                        f"Exception during processing: {type(exc).__name__} "
+                        f"(attempt {attempts}/{MAX_TIMEOUT_RETRIES} — will retry)"
+                    ),
+                )
             agent_status = "error"
-            notes = f"Exception during processing: {type(exc).__name__}: {exc}"
+            notes = f"Exception during processing after {attempts} attempts: {type(exc).__name__}: {exc}"
+
+        # Success (or retries exhausted) — clear any retry bookkeeping.
+        self._clear_failed_attempts(email_id, success=agent_status != "error")
 
         # Mark the email so run_loop skips it on the next poll
         try:
@@ -309,6 +379,46 @@ class OrchestratorAgent:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _record_failed_attempt(self, email_id: str) -> int:
+        """Increment and persist the failure count for *email_id*; return it."""
+        if not email_id:
+            return 0
+        state = _load_retry_state()
+        entry = state.get(email_id, {"attempts": 0})
+        entry["attempts"] = int(entry.get("attempts", 0)) + 1
+        entry["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+        state[email_id] = entry
+        _save_retry_state(state)
+        return entry["attempts"]
+
+    def _clear_failed_attempts(self, email_id: str, success: bool = True) -> None:
+        """Drop retry bookkeeping for *email_id*; on success also remove the label."""
+        if not email_id:
+            return
+        state = _load_retry_state()
+        if email_id not in state:
+            return
+        del state[email_id]
+        _save_retry_state(state)
+        if success:
+            try:
+                self.gmail.remove_label(email_id, "agent-timed-out")
+            except Exception as exc:
+                logger.debug("Could not remove agent-timed-out label id={}: {}", email_id, exc)
+
+    def _in_retry_cooldown(self, email_id: str, retry_state: dict) -> bool:
+        """True if *email_id* failed recently and should be skipped this poll."""
+        entry = retry_state.get(email_id)
+        if not entry:
+            return False
+        try:
+            last = datetime.fromisoformat(entry.get("last_attempt_at", ""))
+        except ValueError:
+            return False
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - last < timedelta(minutes=RETRY_COOLDOWN_MINUTES)
+
     def _poll_once(self) -> None:
         """Fetch one page of unprocessed unread emails and dispatch each."""
         # Use the gmail tool's private helpers directly so we can inject the
@@ -326,8 +436,13 @@ class OrchestratorAgent:
 
         logger.info("Poll found {} unprocessed email(s)", len(stubs))
 
+        retry_state = _load_retry_state()
+
         for stub in stubs:
             message_id: str = stub["id"]
+            if self._in_retry_cooldown(message_id, retry_state):
+                logger.debug("Skipping email id={} — in retry cooldown", message_id)
+                continue
             try:
                 email = self.gmail._fetch_full_message(message_id)  # noqa: SLF001
             except Exception as exc:

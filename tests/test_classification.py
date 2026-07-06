@@ -201,13 +201,21 @@ class TestProcessEmailRouting:
 
     @patch("agents.orchestrator._ollama_client")
     def test_agent_exception_sets_error_status(self, mock_ollama, orchestrator):
+        """First failures are retried; after MAX_TIMEOUT_RETRIES the email is parked."""
+        from agents.orchestrator import MAX_TIMEOUT_RETRIES
+
         orch, mock_referral, *_ = orchestrator
         mock_ollama.chat.return_value = _ollama_response("referral")
         mock_referral.run.side_effect = RuntimeError("Ollama down")
 
-        result = orch.process_email(_make_email())
+        for _attempt in range(MAX_TIMEOUT_RETRIES - 1):
+            result = orch.process_email(_make_email())
+            assert result.agent_status == "error_will_retry"
+            orch.gmail.mark_as_processed.assert_not_called()
 
+        result = orch.process_email(_make_email())
         assert result.agent_status == "error"
+        orch.gmail.mark_as_processed.assert_called_once_with("msg001")
 
     @patch("agents.orchestrator._ollama_client")
     def test_mark_as_processed_always_called(self, mock_ollama, orchestrator):

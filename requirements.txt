@@ -11,5 +11,6 @@ loguru
 fastapi
 uvicorn
 requests
+playwright
 pytest
 pytest-mock
