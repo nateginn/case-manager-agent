@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 
 from loguru import logger
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
 
 from config import settings
+from utils import normalize_dob
 
 _SESSION_PATH = Path(__file__).parent.parent / "memory" / "prompt_emr_session.json"
 _DOWNLOAD_DIR = Path(__file__).parent.parent / "memory" / "emr_downloads"
@@ -278,85 +280,212 @@ class PromptEmrBrowserTool:
     # Patients
     # ------------------------------------------------------------------
 
-    def search_patient(self, patient_name: str) -> dict | None:
+    # Minimum fraction of the EMR card's name tokens that must appear in the
+    # email name for the card to count as a candidate (2 of 3, 3 of 4, ...).
+    _MATCH_THRESHOLD = 0.67
+
+    @staticmethod
+    def _name_variants(name: str) -> list[str]:
         """
-        Search /patients for a patient by name and open their profile.
+        Progressively shorter search queries for a compound name.  Hispanic
+        names often carry a second given name and two surnames that the EMR
+        chart may not include, so after the full name we drop interior
+        tokens, ending with "first last-token" as the broadest safe query.
+        Never yields a single-token query (too ambiguous).
+        """
+        tokens = [t for t in re.split(r"\s+", (name or "").strip()) if t]
+        variants: list[str] = []
+
+        def add(parts: list[str]) -> None:
+            query = " ".join(parts)
+            if len(parts) >= 2 and query.lower() not in {v.lower() for v in variants}:
+                variants.append(query)
+
+        add(tokens)
+        if len(tokens) >= 3:
+            add([tokens[0]] + tokens[2:])   # drop second given name
+        if len(tokens) >= 4:
+            add([tokens[0]] + tokens[3:])   # drop second given name + first surname
+        if len(tokens) >= 2:
+            add([tokens[0], tokens[-1]])    # first + last token fallback
+        return variants
+
+    @staticmethod
+    def _score_name_match(emr_name: str, email_name: str) -> float:
+        """
+        Fraction of the EMR card's name tokens found in the email's name.
+        The EMR name is usually a subset of the fuller email name, so we
+        score in that direction.  Hard rule: the EMR first name must appear
+        in the email name, otherwise 0.0 — surname overlap alone must never
+        select a patient.
+        """
+        emr_tokens = [t for t in re.split(r"[\s,]+", (emr_name or "").lower()) if t]
+        email_tokens = {t for t in re.split(r"[\s,]+", (email_name or "").lower()) if t}
+        if not emr_tokens or not email_tokens:
+            return 0.0
+        if emr_tokens[0] not in email_tokens:
+            return 0.0
+        return sum(1 for t in emr_tokens if t in email_tokens) / len(emr_tokens)
+
+    _DOB_ON_PAGE_RE = re.compile(
+        r"(?:DOB|Date of Birth|Birth ?date)\s*:?\s*"
+        r"([0-9]{1,4}[/\-.][0-9]{1,2}[/\-.][0-9]{2,4})",
+        re.IGNORECASE,
+    )
+
+    def _read_profile_dob(self) -> str:
+        """DOB from the currently-open profile page, as MM/DD/YYYY or ""."""
+        try:
+            body_text = self._page.inner_text("body")
+        except Exception:
+            return ""
+        match = self._DOB_ON_PAGE_RE.search(body_text)
+        return normalize_dob(match.group(1)) if match else ""
+
+    def _goto_patient_search(self, query: str) -> bool:
+        """Open /patients, fill the search box, and wait for results."""
+        self._page.goto(
+            f"{settings.PROMPT_EMR_BASE_URL}/patients",
+            wait_until="load",
+            timeout=20_000,
+        )
+        self._page.wait_for_timeout(2_000)
+        filled = self._fill_first(
+            ["input[placeholder*='search' i]", "input[type='search']"],
+            query,
+        )
+        if not filled:
+            logger.error("PromptEmrBrowserTool: patient search input not found")
+            self._screenshot("patient_search_error")
+            return False
+        self._page.wait_for_timeout(2_000)
+        return True
+
+    def _open_result(self, index: int) -> dict | None:
+        """
+        Click the *index*-th result card on the current results page and read
+        the profile.  Returns {"name", "account_number", "profile_url", "dob"}
+        or None if the click did not open a profile.
+        """
+        card = self._page.locator("div.patient").nth(index)
+        card_name = card.inner_text().split("\n")[0].strip()
+        card.click()
+        self._page.wait_for_timeout(3_000)
+
+        profile_url = self._page.url
+        if "/patients/" not in profile_url:
+            logger.warning("PromptEmrBrowserTool: click did not open a profile (url={})", profile_url)
+            self._screenshot("patient_profile_error")
+            return None
+
+        # Account number appears as "Acct#: 1001681-ARR" on the profile
+        acct = ""
+        try:
+            body_text = self._page.inner_text("body")
+            for line in body_text.split("\n"):
+                if line.strip().startswith("Acct#:"):
+                    acct = line.split("Acct#:", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+
+        return {
+            "name": card_name,
+            "account_number": acct,
+            "profile_url": profile_url,
+            "dob": self._read_profile_dob(),
+        }
+
+    def search_patient(self, patient_name: str, dob: str = "") -> dict | None:
+        """
+        Search /patients for a patient and open their profile.
 
         Verified flow (2026-07-06):
           1. goto /patients
           2. fill input[placeholder='Search patients']
-          3. click the first div.patient result card
+          3. click a div.patient result card
           4. profile URL becomes /patients/<uuid>
 
+        Name matching (2026-07-07): tries progressively shorter queries
+        (see _name_variants) because email names are often fuller than the
+        EMR chart name.  Every result card is scored against the email name
+        (_score_name_match); the best-scoring card above threshold wins.
+        When several cards qualify AND *dob* was supplied, each candidate's
+        profile DOB is checked and the first DOB match wins; if none match,
+        the best name match is used (same behavior as no-DOB).
+
+        Args:
+            patient_name: the name as it appeared in the email.
+            dob:          optional date of birth from the email, any common
+                          format; used only to disambiguate multiple matches.
+
         Returns:
-            {"name", "account_number", "profile_url"} on success, None if
-            no result was found.
+            {"name", "account_number", "profile_url", "dob"} on success,
+            None if no result scored above threshold on any query variant.
         """
         if not self.login():
             return None
 
+        want_dob = normalize_dob(dob)
+
         try:
-            self._page.goto(
-                f"{settings.PROMPT_EMR_BASE_URL}/patients",
-                wait_until="load",
-                timeout=20_000,
-            )
-            self._page.wait_for_timeout(2_000)
+            for variant in self._name_variants(patient_name):
+                if not self._goto_patient_search(variant):
+                    return None
 
-            filled = self._fill_first(
-                ["input[placeholder*='search' i]", "input[type='search']"],
-                patient_name,
-            )
-            if not filled:
-                logger.error("PromptEmrBrowserTool: patient search input not found")
-                self._screenshot("patient_search_error")
-                return None
+                cards = self._page.locator("div.patient")
+                candidates: list[tuple[float, int, str]] = []
+                for i in range(cards.count()):
+                    card_name = cards.nth(i).inner_text().split("\n")[0].strip()
+                    score = self._score_name_match(card_name, patient_name)
+                    if score >= self._MATCH_THRESHOLD:
+                        candidates.append((score, i, card_name))
+                if not candidates:
+                    logger.debug(
+                        "PromptEmrBrowserTool: no candidate above threshold for query variant "
+                        "({} cards shown)", cards.count(),
+                    )  # HIPAA: no names logged
+                    continue
 
-            # Wait for the results list to render
-            self._page.wait_for_timeout(2_000)
+                candidates.sort(key=lambda c: -c[0])
 
-            result = self._page.locator("div.patient").first
-            if result.count() == 0:
-                logger.warning("PromptEmrBrowserTool: no patient result for {!r}", patient_name)
-                self._screenshot("patient_not_found")
-                return None
+                if len(candidates) > 1 and want_dob:
+                    # Secondary confirmation: open candidates best-first and
+                    # keep the first whose profile DOB matches the email's.
+                    for _score, idx, _cname in candidates:
+                        result = self._open_result(idx)
+                        if result and result["dob"] and result["dob"] == want_dob:
+                            logger.info("PromptEmrBrowserTool: patient confirmed by DOB ({})",
+                                        result["profile_url"])
+                            return result
+                        # Back to the results list for the next candidate.
+                        if not self._goto_patient_search(variant):
+                            return None
+                    logger.warning(
+                        "PromptEmrBrowserTool: DOB confirmed none of {} candidates; "
+                        "falling back to best name match", len(candidates),
+                    )
 
-            result_name = result.inner_text().split("\n")[0].strip()
-            result.click()
-            self._page.wait_for_timeout(3_000)
+                result = self._open_result(candidates[0][1])
+                if result:
+                    logger.info("PromptEmrBrowserTool: opened patient ({})", result["profile_url"])
+                    return result
 
-            profile_url = self._page.url
-            if "/patients/" not in profile_url:
-                logger.warning("PromptEmrBrowserTool: click did not open a profile (url={})", profile_url)
-                self._screenshot("patient_profile_error")
-                return None
-
-            # Account number appears as "Acct#: 1001681-ARR" on the profile
-            acct = ""
-            try:
-                body_text = self._page.inner_text("body")
-                for line in body_text.split("\n"):
-                    if line.strip().startswith("Acct#:"):
-                        acct = line.split("Acct#:", 1)[1].strip()
-                        break
-            except Exception:
-                pass
-
-            logger.info("PromptEmrBrowserTool: opened patient {!r} ({})", result_name, profile_url)
-            return {
-                "name": result_name,
-                "account_number": acct,
-                "profile_url": profile_url,
-            }
+            logger.warning("PromptEmrBrowserTool: no patient result for {!r}", patient_name)
+            self._screenshot("patient_not_found")
+            return None
 
         except Exception as exc:
             logger.error("PromptEmrBrowserTool: search_patient failed: {}", exc)
             self._screenshot("patient_search_error")
             return None
 
-    def get_patient_visits(self, patient_name: str) -> dict | None:
+    def get_patient_visits(self, patient_name: str, dob: str = "") -> dict | None:
         """
         Search for a patient, open their Visits tab, and parse the visit table.
+
+        *dob* (optional, any common format) is passed to search_patient for
+        secondary confirmation when several charts match the name.
 
         Verified flow (2026-07-06): the Visits tab is a Quasar chip with
         name="visitList"; the visit table rows contain cells:
@@ -374,7 +503,7 @@ class PromptEmrBrowserTool:
             }
             or None if the patient was not found.
         """
-        patient = self.search_patient(patient_name)
+        patient = self.search_patient(patient_name, dob=dob)
         if patient is None:
             return None
 

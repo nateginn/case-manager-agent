@@ -49,6 +49,44 @@ def atomic_write_json(path: Path, data: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Date-of-birth normalization
+# ---------------------------------------------------------------------------
+
+_DOB_FORMATS = (
+    "%Y-%m-%d",       # 2007-09-18
+    "%m/%d/%Y",       # 09/18/2007, 9/18/2007
+    "%m/%d/%y",       # 9/18/07
+    "%m-%d-%Y",       # 09-18-2007
+    "%m-%d-%y",       # 09-18-07
+    "%m.%d.%Y",       # 9.18.2007
+    "%m.%d.%y",       # 9.18.07
+    "%B %d, %Y",      # September 18, 2007
+    "%B %d %Y",       # September 18 2007
+    "%b %d, %Y",      # Sep 18, 2007
+    "%b %d %Y",       # Sep 18 2007
+    "%d %B %Y",       # 18 September 2007
+)
+
+
+def normalize_dob(raw: str) -> str:
+    """
+    Normalize a date-of-birth string from any common email/EMR format to
+    ``MM/DD/YYYY`` so two independently-sourced DOBs can be compared with
+    ``==``.  Returns "" when *raw* is empty or unparseable — callers treat
+    that as "no DOB available", never as a match.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    for fmt in _DOB_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%m/%d/%Y")
+        except ValueError:
+            continue
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Bounded retry for transient API errors
 # ---------------------------------------------------------------------------
 

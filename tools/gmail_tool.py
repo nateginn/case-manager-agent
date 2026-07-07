@@ -12,7 +12,8 @@ from __future__ import annotations
 import base64
 import html as html_lib
 import json as _json
-from email import message_from_bytes
+from email import encoders, message_from_bytes
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -390,6 +391,29 @@ class GmailTool:
         )
         return raw_bytes
 
+    def fetch_message_attachments(self, email: dict) -> list[dict]:
+        """
+        Download every attachment of an email dict (as returned by the fetch
+        methods, which include ``attachment_parts``).
+
+        Returns:
+            List of ``{"filename": str, "mime_type": str, "data": bytes}``.
+            Parts without an attachment_id (rare inline parts) are skipped.
+
+        PHI note: attachment bytes are never logged.
+        """
+        out: list[dict] = []
+        for part in email.get("attachment_parts", []):
+            if not part.get("attachment_id"):
+                continue
+            data = self.fetch_attachment(email["id"], part["attachment_id"])
+            out.append({
+                "filename": part["filename"],
+                "mime_type": part.get("mime_type") or "application/octet-stream",
+                "data": data,
+            })
+        return out
+
     # ------------------------------------------------------------------
     # 4. Create draft
     # ------------------------------------------------------------------
@@ -435,6 +459,7 @@ class GmailTool:
         cc: str = "",
         in_reply_to: str = "",
         signature_html: str = "",
+        attachments: list[dict] | None = None,
     ) -> str:
         """
         Create a Gmail draft.  Never sends the message.
@@ -452,24 +477,20 @@ class GmailTool:
             signature_html: Optional signature HTML (from ``get_signature()``).
                          When present the draft gets an HTML part with the
                          signature appended below the body.
+            attachments: Optional list of ``{"filename", "mime_type", "data"}``
+                         dicts (as returned by ``fetch_message_attachments``)
+                         to attach — used for forward drafts.
 
         Returns:
             The draft ID string (e.g. ``"r123456789"``).
 
         PHI note: only the draft ID is logged.
         """
-        logger.info("Creating draft subject_len={}", len(subject))  # HIPAA: no PHI logged
+        logger.info("Creating draft subject_len={} attachments={}",
+                    len(subject), len(attachments or []))  # HIPAA: no PHI logged
 
-        mime = MIMEMultipart("alternative")
-        mime["To"] = to
-        mime["From"] = settings.GMAIL_USER_EMAIL
-        mime["Subject"] = subject
-        if cc:
-            mime["Cc"] = cc
-        if in_reply_to:
-            mime["In-Reply-To"] = in_reply_to
-            mime["References"] = in_reply_to
-        mime.attach(MIMEText(body, "plain", "utf-8"))
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body, "plain", "utf-8"))
 
         if signature_html:
             # HTML alternative: body text (escaped, newlines -> <br>) with the
@@ -479,7 +500,34 @@ class GmailTool:
             html_part = (
                 f'<div dir="ltr">{escaped}<br><br>{signature_html}</div>'
             )
-            mime.attach(MIMEText(html_part, "html", "utf-8"))
+            alt.attach(MIMEText(html_part, "html", "utf-8"))
+
+        if attachments:
+            mime = MIMEMultipart("mixed")
+            mime.attach(alt)
+            for att in attachments:
+                maintype, _, subtype = (
+                    att.get("mime_type") or "application/octet-stream"
+                ).partition("/")
+                part = MIMEBase(maintype, subtype or "octet-stream")
+                part.set_payload(att["data"])
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition", "attachment",
+                    filename=att.get("filename") or "attachment",
+                )
+                mime.attach(part)
+        else:
+            mime = alt
+
+        mime["To"] = to
+        mime["From"] = settings.GMAIL_USER_EMAIL
+        mime["Subject"] = subject
+        if cc:
+            mime["Cc"] = cc
+        if in_reply_to:
+            mime["In-Reply-To"] = in_reply_to
+            mime["References"] = in_reply_to
 
         encoded = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
         message_body: dict[str, Any] = {"raw": encoded}
@@ -862,7 +910,7 @@ class GmailTool:
 
         logger.debug("Processing message_id={}", message_id)  # HIPAA: no PHI logged
 
-        body_text, body_html, has_attachments, attachment_filenames = (
+        body_text, body_html, has_attachments, attachment_parts = (
             self._extract_parts(msg["payload"])
         )
 
@@ -879,39 +927,41 @@ class GmailTool:
             "body_text": body_text,
             "body_html": body_html,
             "has_attachments": has_attachments,
-            "attachment_filenames": attachment_filenames,
+            "attachment_filenames": [p["filename"] for p in attachment_parts],
+            "attachment_parts": attachment_parts,
         }
 
     def _extract_parts(
         self, payload: dict
-    ) -> tuple[str, str, bool, list[str]]:
+    ) -> tuple[str, str, bool, list[dict]]:
         """
         Recursively walk a Gmail payload dict and collect:
           - plain-text body
           - HTML body
           - whether any attachments are present
-          - list of attachment filenames (not the bytes — those are lazy-fetched)
+          - attachment parts: {filename, mime_type, attachment_id} dicts
+            (not the bytes — those are lazy-fetched via fetch_attachment)
 
-        Returns (body_text, body_html, has_attachments, attachment_filenames).
+        Returns (body_text, body_html, has_attachments, attachment_parts).
         """
         body_text_parts: list[str] = []
         body_html_parts: list[str] = []
-        attachment_filenames: list[str] = []
+        attachment_parts: list[dict] = []
 
-        self._walk_parts(payload, body_text_parts, body_html_parts, attachment_filenames)
+        self._walk_parts(payload, body_text_parts, body_html_parts, attachment_parts)
 
         body_text = "\n".join(body_text_parts)
         body_html = "\n".join(body_html_parts)
-        has_attachments = bool(attachment_filenames)
+        has_attachments = bool(attachment_parts)
 
-        return body_text, body_html, has_attachments, attachment_filenames
+        return body_text, body_html, has_attachments, attachment_parts
 
     def _walk_parts(
         self,
         part: dict,
         text_acc: list[str],
         html_acc: list[str],
-        attachments_acc: list[str],
+        attachments_acc: list[dict],
     ) -> None:
         """Depth-first traversal of a MIME part tree."""
         mime_type: str = part.get("mimeType", "")
@@ -925,9 +975,13 @@ class GmailTool:
                 self._walk_parts(sub, text_acc, html_acc, attachments_acc)
             return
 
-        # Attachment — record filename; bytes are fetched on demand
+        # Attachment — record metadata; bytes are fetched on demand
         if filename:
-            attachments_acc.append(filename)
+            attachments_acc.append({
+                "filename": filename,
+                "mime_type": mime_type or "application/octet-stream",
+                "attachment_id": body.get("attachmentId", ""),
+            })
             return
 
         # Inline body part

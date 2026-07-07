@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     CLAIRE_GREELEY_SPACE_ID: str = ""          # falls back to GOOGLE_CHAT_SPACE_GREELEY
     CLAIRE_DENVER_SPACE_ID: str = ""           # falls back to GOOGLE_CHAT_SPACE_DENVER
     CLAIRE_EMR_LOOKUP_ENABLED: bool = False    # auto-draft replies to visit inquiries via Prompt EMR
+    CLAIRE_PAV_FORWARD_ENABLED: bool = True    # auto-draft forwards of Marrick PAV requests to billing
+    CLAIRE_BILLING_FORWARD_TO: str = "brittneymccarty.abc@gmail.com"  # billing team member for PAVs
+    CLAIRE_BILLING_FORWARD_NAME: str = "Brit"  # greeting name in the PAV forward note
 
 
 settings = Settings()

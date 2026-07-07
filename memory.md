@@ -467,3 +467,121 @@ User wants to verify live behavior before committing — ASK before committing.
 2. Remove legacy agents/jarvis_agent.py (509 lines, superseded by Claire) +
    memory/jarvis_state.json — DELETION, so ask user first
 3. Integration tests with mocked Google APIs; PHI scrub gaps (patient names, MRNs)
+
+## 2026-07-06 (late) — Visit-inquiry expansion: MedHub / ProvePartners / multi-patient
+
+Built in the DEV copy only (`case-manager-agent-dev/`); NOT yet deployed to
+production (`D:/Dev/case-manager-agent/`).
+
+**Inbox mining first**: categorized 185 inbox emails from the last 3 weeks
+(script: `mine_inbox.py`, read-only). Top categories: Marrick auth lifecycle
+(~33), visit/scheduling inquiries (~23, incl. ~11 MedHub/ProvePartners
+templated forms), billing/EOB (~20), attorney lien/balance (~15), PAV (~13).
+User picked MedHub/ProvePartners extension as the next build.
+
+**Changes (agents/visit_inquiry.py + tests/test_visit_inquiry.py)**:
+- Classifier prompt broadened: treatment-status updates (date of last visit /
+  next appointment / visits-to-date), scheduled-confirmation asks, and care
+  coordination / attendance confirmation forms now count as visit inquiries.
+  Billing/records/auth-paperwork still excluded.
+- Multi-patient: classifier returns `patient_names` (list, capped at 4 by
+  `_MAX_PATIENTS`); `try_handle` looks all of them up in ONE Playwright EMR
+  session; reply has a per-patient section; patients not found in the EMR get
+  "We have no record of this patient at our clinic." `result["patient_name"]`
+  is now a comma-joined display string (claire_agent unchanged).
+- Reply template gained a summary block per patient answering MedHub's exact
+  ask: "Date of last visit / Next scheduled appointment / Visits completed to
+  date" (completed = stage contains "complete"; falls back to count if the
+  EMR gave no stages). Last/next chosen by parsed date, not list order.
+- classify body window 2000→3000 chars, num_predict 100→200.
+
+**Validation**: 117 unit tests passing (+8 new). Live dry-run of the
+classifier against 23 real inbox emails (`scratch_dryrun_classify.py`,
+read-only): 23/23 correct, incl. 3 patients extracted from a MedHub
+companions email and 2 from a ProvePartners combined form; all 9 negative
+cases (PAV, EOB, lien, records, credentialing, auth cancellation, reduction
+offer) rejected. Both medhub.health and provepartners.com are already
+trusted sender domains, so these emails reach the pipeline.
+
+**Deploy note**: copy CODE ONLY (agents/visit_inquiry.py,
+tests/test_visit_inquiry.py) to production — never memory/*.json, token.json,
+assistant_token.json, prompt_emr_session.json, .env (production runtime state
+is live and ahead). Production restart requires user OK.
+
+## 2026-07-06 (later) — Marrick PAV auto-forward to billing (dev only, NOT deployed)
+
+User Q&A that shaped this: (a) visit-line columns stay as-is (no provider/
+facility/visit# re-added); (b) PAV forwards are DRAFTS for approval, not
+auto-send — Claire still never sends email; (c) a "visit check <patient>"
+Chat command was confirmed feasible and user wants it, but PAV was built
+first — the command is the NEXT build.
+
+**New: agents/pav_request.py** — deterministic (no LLM): sender @marrick.com
++ \bPAV\b or "patient account verification" in subject/body[:2000]. Creates a
+forward draft to settings.CLAIRE_BILLING_FORWARD_TO (Brittney,
+brittneymccarty.abc@gmail.com, greeting name CLAIRE_BILLING_FORWARD_NAME
+"Brit") asking her to reply-all in the same email string when the PAV is
+returned; carries original body + ALL attachments (incl. harmless inline
+signature images); threads into the same Gmail conversation. Chat card:
+"📄 Marrick PAV request auto-handled". Kill switch:
+CLAIRE_PAV_FORWARD_ENABLED (default true). Dedup: state["pav_requests"]
+per thread, mirrors visit_inquiries. Failure → falls through to normal
+notification with a "_pav_note".
+
+**GmailTool additions**: attachment_parts (filename/mime_type/attachment_id)
+now captured on every fetched email; fetch_message_attachments(email) →
+[{filename, mime_type, data}]; create_draft(attachments=[...]) builds
+multipart/mixed. attachment_filenames still present (referral_agent etc.
+unchanged).
+
+**Validation**: 129 tests passing (+12 new in tests/test_pav_request.py).
+Detector dry-run over all 185 mined emails: 11/11 real PAV requests fired,
+0 false positives (38 other Marrick emails + 146 non-Marrick all skipped).
+
+**Deploy set for both 2026-07-06 features (code-only)**: agents/visit_inquiry.py,
+agents/pav_request.py, agents/claire_agent.py, tools/gmail_tool.py, config.py,
+tests/test_visit_inquiry.py, tests/test_pav_request.py. Restart needs user OK.
+
+## 2026-07-07 — Flexible patient-name matching + DOB confirmation (dev only, NOT deployed)
+
+Motivating failure: email asked about "Ariadne Alejandra Orozco Mendoza";
+EMR chart is "Ariadne Orozco Mendoza" (no second given name) → old
+search_patient typed the full name verbatim, got 0 results, and blindly
+clicked `.first` when results DID exist.
+
+**tools/prompt_emr_browser_tool.py**:
+- `_name_variants(name)` — progressive query shortening: full name → drop
+  2nd given name → drop 2nd given + 1st surname → "first last-token".
+  Never single-token.
+- `_score_name_match(emr_name, email_name)` — fraction of EMR-card tokens
+  found in the email name; hard 0.0 if EMR first name absent from email
+  name (surname overlap can never select). Threshold `_MATCH_THRESHOLD`=0.67.
+- `search_patient(patient_name, dob="")` — scores ALL result cards (no more
+  blind `.first`); if >1 candidate AND email provided a DOB, opens each
+  best-first and keeps the one whose profile DOB matches
+  (`_read_profile_dob`, regex over body for DOB:/Date of Birth:); if DOB
+  confirms nobody, falls back to best name match. Result dict now includes
+  "dob". `get_patient_visits` gained `dob=` passthrough.
+
+**agents/visit_inquiry.py**: classifier prompt now also extracts
+`patient_dobs` (aligned with patient_names, verbatim from email);
+`_parse_patient_dobs` normalizes/pads. `try_handle` zips names+dobs into
+`get_patient_visits(name, dob=dob)`.
+
+**utils.py**: new `normalize_dob(raw) -> "MM/DD/YYYY" | ""` shared by both
+files (handles ISO, US slash/dash/dot, 2-digit years, month names).
+
+**Validation**: 148 tests passing (+19). Live classifier dry-run: DOBs
+correctly extracted+normalized from MedHub ISO format, ProvePartners
+US format, matlin inline, and subject-line DOBs (4/4 emails). Live EMR
+search 2026-07-07 00:26: query "Ariadne Alejandra Orozco Mendoza" resolved
+via variant 2 to chart "Ariadne Orozco Mendoza" (acct 1005472-ARR) and the
+profile DOB read back 09/18/2007 matching the email — PASS (~11s).
+
+Session cache note: dev's prompt_emr_session.json expired ~00:18 and was
+refreshed via headed login (user clicked human-verify) at 00:25. PRODUCTION
+has its OWN session file — if production Chat notes say EMR lookup failed,
+rerun `test_prompt_emr_login.py --headed` from D:/Dev/case-manager-agent/.
+
+**Deploy set now also includes**: tools/prompt_emr_browser_tool.py, utils.py,
+tests/test_prompt_emr_matching.py (on top of the 2026-07-06 list).

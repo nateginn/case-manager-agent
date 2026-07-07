@@ -45,7 +45,7 @@ from config import settings
 from tools.gmail_tool import GmailTool
 from tools.google_chat_tool import GoogleChatTool
 from utils import atomic_write_json, retry_call
-from . import sender_lists, visit_inquiry
+from . import pav_request, sender_lists, visit_inquiry
 
 _STATE_PATH = Path(__file__).parent.parent / "memory" / "claire_state.json"
 
@@ -229,6 +229,54 @@ class ClaireAgent:
                 junk_batch.append(email)
                 seen_junk_thread_ids.add(thread_id)
                 continue
+
+            # Marrick PAV auto-forward: deterministic detection + forward
+            # draft to the billing team. One attempt per thread.
+            if (
+                settings.CLAIRE_PAV_FORWARD_ENABLED
+                and thread_id not in state.get("pav_requests", {})
+            ):
+                result = pav_request.try_handle(email, self.gmail)
+                if result is not None:
+                    state.setdefault("pav_requests", {})[thread_id] = {
+                        "status": result["status"],
+                        "email_id": email_id,
+                        "handled_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if result["status"] == "drafted":
+                        sender_short = (email.get("sender", "") or "")[:60]
+                        att = result["attachment_count"]
+                        self._send_tracked(
+                            f"📄 *Marrick PAV request auto-handled*\n"
+                            f"From: {sender_short}\n"
+                            f"Subject: {email.get('subject', '(no subject)')[:80]}\n"
+                            f"➡️ A forward *draft* to "
+                            f"{settings.CLAIRE_BILLING_FORWARD_NAME} "
+                            f"({att} attachment{'s' if att != 1 else ''}) is waiting "
+                            f"in Gmail Drafts — review and send."
+                        )
+                        # Track as pending so sync/expiry still applies to the thread.
+                        state["emails"][thread_id] = {
+                            "email_id": email_id,
+                            "thread_id": thread_id,
+                            "status": "pending",
+                            "subject": email.get("subject", "(no subject)"),
+                            "sender": email.get("sender", ""),
+                            "notified_at": datetime.now(timezone.utc).isoformat(),
+                            "expires_at": (
+                                datetime.now(timezone.utc)
+                                + timedelta(hours=settings.CLAIRE_REPLY_TIMEOUT_HOURS)
+                            ).isoformat(),
+                            "pav_request": True,
+                        }
+                        auto_drafted += 1
+                        continue
+                    # draft_error — fall through to the normal notification
+                    # with a note about what was attempted.
+                    email["_pav_note"] = (
+                        "(I detected a Marrick PAV request but couldn't create "
+                        "the forward draft — please forward it to billing manually.)"
+                    )
 
             # Visit-inquiry auto-draft: classify + EMR lookup + reply-all draft.
             # One attempt per thread — success or failure is recorded so we
@@ -831,7 +879,7 @@ class ClaireAgent:
 
         # Note from a visit-inquiry attempt that couldn't complete (patient not
         # found / EMR error) — tells the case manager what was already tried.
-        inquiry_note = email.get("_visit_inquiry_note", "")
+        inquiry_note = email.get("_visit_inquiry_note", "") or email.get("_pav_note", "")
         inquiry_line = f"\n⚕️ {inquiry_note}" if inquiry_note else ""
 
         return (
