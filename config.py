@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     CLAIRE_PAV_FORWARD_ENABLED: bool = True    # auto-draft forwards of Marrick PAV requests to billing
     CLAIRE_BILLING_FORWARD_TO: str = "brittneymccarty.abc@gmail.com"  # billing team member for PAVs
     CLAIRE_BILLING_FORWARD_NAME: str = "Brit"  # greeting name in the PAV forward note
+    CLAIRE_QUIET_HOURS_ENABLED: bool = True    # auto-pause notifications overnight
+    CLAIRE_QUIET_HOURS_START: str = "21:00"    # local machine time, HH:MM
+    CLAIRE_QUIET_HOURS_END: str = "07:00"      # window may span midnight
 
 
 settings = Settings()

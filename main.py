@@ -95,7 +95,6 @@ _monitoring_agent: MonitoringAgent | None = None
 _claire_agent = None
 _claire_thread: threading.Thread | None = None
 _claire_lock = threading.Lock()
-_claire_paused: bool = False
 
 # Prevents two manual /agent/run calls from running simultaneously.
 _poll_lock = threading.Lock()
@@ -115,10 +114,14 @@ def _polling_worker(interval: int = 60) -> None:
 
 
 def _claire_worker(interval: int = 45) -> None:
-    """Daemon thread body: run one Claire cycle per interval seconds."""
+    """
+    Daemon thread body: run one Claire cycle per interval seconds.
+    Pause handling lives inside run_cycle — a paused Claire still polls
+    Chat so *resume* works remotely.
+    """
     logger.info("Claire polling thread started (interval={}s)", interval)
     while True:
-        if not _claire_paused and _claire_agent is not None:
+        if _claire_agent is not None:
             try:
                 _claire_agent.run_cycle()
             except Exception as exc:
@@ -1243,6 +1246,13 @@ def health() -> dict:
     except Exception:
         pass
 
+    claire_paused, pause_reason = False, ""
+    if _claire_agent is not None:
+        try:
+            claire_paused, pause_reason = _claire_agent.is_paused()
+        except Exception as exc:
+            logger.warning("health: is_paused failed: {}", exc)
+
     return {
         "status": "ok",
         "model": settings.OLLAMA_MODEL,
@@ -1252,8 +1262,9 @@ def health() -> dict:
         "polling_enabled": settings.ENABLE_POLLING,
         "polling_active": _poll_thread is not None and _poll_thread.is_alive(),
         "claire_enabled": settings.CLAIRE_ENABLED,
-        "claire_active": _claire_thread is not None and _claire_thread.is_alive() and not _claire_paused,
-        "claire_paused": _claire_paused,
+        "claire_active": _claire_thread is not None and _claire_thread.is_alive() and not claire_paused,
+        "claire_paused": claire_paused,
+        "claire_pause_reason": pause_reason,
     }
 
 
@@ -1321,23 +1332,22 @@ async def timeouts_reset():
 
 @app.post("/claire/pause")
 async def claire_pause():
-    """Pause Claire's background polling without stopping the server."""
-    global _claire_paused
+    """
+    Hold Claire's notifications (persists across restarts).  Claire keeps
+    polling Chat while paused, so *resume* also works from the Chat space.
+    """
     if _claire_agent is None:
         raise HTTPException(status_code=503, detail="Claire is not enabled.")
-    _claire_paused = True
-    logger.info("Claire polling paused via POST /claire/pause")
+    _claire_agent.pause()
     return {"status": "paused", "claire_active": False}
 
 
 @app.post("/claire/resume")
 async def claire_resume():
-    """Resume Claire's background polling."""
-    global _claire_paused
+    """Resume Claire's notifications (overrides quiet hours until the window ends)."""
     if _claire_agent is None:
         raise HTTPException(status_code=503, detail="Claire is not enabled.")
-    _claire_paused = False
-    logger.info("Claire polling resumed via POST /claire/resume")
+    _claire_agent.resume()
     return {"status": "resumed", "claire_active": True}
 
 

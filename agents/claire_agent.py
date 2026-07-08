@@ -19,6 +19,14 @@ Space-level commands (type anywhere in the space):
   new day / clean start — delete ALL Chat messages + wipe state for a fresh start
   reset / clear all     — dismiss all pending notifications (keeps Chat history)
   trash all             — confirm a pending junk batch deletion
+  pause / good night    — hold new notifications; Claire keeps listening
+  resume / good morning — resume notifications (also overrides quiet hours)
+
+Quiet hours: when CLAIRE_QUIET_HOURS_ENABLED, notifications are held
+automatically between CLAIRE_QUIET_HOURS_START and _END (local time).
+While paused (manually or by quiet hours) Claire still polls Chat every
+cycle, so commands — including *resume* — work from anywhere.  Pause
+state persists in claire_state.json across restarts.
 
 Auto-sync: each cycle checks pending/waiting entries against Gmail and
 auto-resolves any that are no longer in the inbox (handled manually).
@@ -80,9 +88,65 @@ _CLAIRE_MSG_PREFIXES = (
     "⏰ ", "📋 Reminder", "↩️ ", "🗑️ ", "Got it —", "Forwarded to",
     "Done —", "Cancelled —", "Skipped —", "⚠️ Confirm",
     "Waiting for confirmation", "I didn't understand",
+    "⏸️ ", "▶️ ", "🌙 ", "☀️ ",
 )
 
 _ollama_client = ollama.Client(timeout=30)
+
+# ---------------------------------------------------------------------------
+# Pause / quiet-hours helpers (pure functions — no I/O)
+# ---------------------------------------------------------------------------
+
+# Exact-match command words (normalized) — containment matching would trip on
+# ordinary sentences ("don't pause", "the pause button"), so unlike the other
+# space-level commands these require the whole message to be the command.
+_PAUSE_WORDS = frozenset({"pause", "good night", "goodnight", "sleep"})
+_RESUME_WORDS = frozenset({"resume", "unpause", "wake up", "good morning", "goodmorning"})
+
+_PAUSE_DEFAULTS = {"manual": False, "override_until": "", "announced": ""}
+
+
+def _match_pause_command(text: str) -> str | None:
+    """Return "pause"/"resume" if *text* is exactly a pause command, else None."""
+    normalized = re.sub(r"[^a-z ]", "", (text or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in _PAUSE_WORDS:
+        return "pause"
+    if normalized in _RESUME_WORDS:
+        return "resume"
+    return None
+
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    hour, minute = value.strip().split(":")
+    return int(hour), int(minute)
+
+
+def _in_quiet_hours(now: datetime, start: str, end: str) -> bool:
+    """
+    True if local time *now* falls inside the [start, end) window.
+    Windows may span midnight (e.g. 21:00–07:00).  start == end means the
+    window is degenerate and never active.
+    """
+    start_h, start_m = _parse_hhmm(start)
+    end_h, end_m = _parse_hhmm(end)
+    start_min = start_h * 60 + start_m
+    end_min = end_h * 60 + end_m
+    now_min = now.hour * 60 + now.minute
+    if start_min == end_min:
+        return False
+    if start_min < end_min:
+        return start_min <= now_min < end_min
+    return now_min >= start_min or now_min < end_min
+
+
+def _quiet_hours_end(now: datetime, end: str) -> datetime:
+    """End of the current quiet window; assumes *now* is inside the window."""
+    end_h, end_m = _parse_hhmm(end)
+    end_dt = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+    if end_dt <= now:
+        end_dt += timedelta(days=1)
+    return end_dt
 
 
 class ClaireAgent:
@@ -110,9 +174,19 @@ class ClaireAgent:
     # ------------------------------------------------------------------
 
     def run_cycle(self) -> dict:
-        """Run one full Claire cycle."""
-        summary: dict = {"synced": 0, "expired": 0, "nudged": 0, "replies_handled": 0, "new_notifications": 0, "errors": 0}
+        """
+        Run one Claire cycle.  While paused (manual command or quiet hours)
+        only Chat replies are polled — Claire stays reachable for *resume*
+        and card commands but sends no new notifications, nudges, or drafts.
+        """
+        summary: dict = {"synced": 0, "expired": 0, "nudged": 0, "replies_handled": 0, "new_notifications": 0, "errors": 0, "paused": ""}
         try:
+            paused, reason = self.is_paused()
+            self._announce_pause_transition(paused, reason)
+            if paused:
+                summary["paused"] = reason
+                summary["replies_handled"] = self._poll_chat_replies()
+                return summary
             summary["synced"] = self._sync_pending_state()
             summary["expired"] = self._expire_stale_entries()
             summary["nudged"] = self._send_nudges()
@@ -122,6 +196,90 @@ class ClaireAgent:
             logger.error("ClaireAgent.run_cycle error: {}", exc)
             summary["errors"] += 1
         return summary
+
+    # ------------------------------------------------------------------
+    # Pause / resume
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_paused(state: dict) -> tuple[bool, str]:
+        """Effective pause status from persisted state + the clock."""
+        pause = state.get("pause") or {}
+        if pause.get("manual"):
+            return True, "manual"
+        if settings.CLAIRE_QUIET_HOURS_ENABLED:
+            now = datetime.now()  # local time — quiet hours are wall-clock
+            if _in_quiet_hours(now, settings.CLAIRE_QUIET_HOURS_START,
+                               settings.CLAIRE_QUIET_HOURS_END):
+                override = pause.get("override_until", "")
+                if override:
+                    try:
+                        if now < datetime.fromisoformat(override):
+                            return False, ""
+                    except ValueError:
+                        pass
+                return True, "quiet_hours"
+        return False, ""
+
+    def is_paused(self) -> tuple[bool, str]:
+        """(paused, reason) where reason is "manual", "quiet_hours", or ""."""
+        return self._compute_paused(self._load_state())
+
+    @staticmethod
+    def _apply_pause(state: dict) -> None:
+        pause = state.setdefault("pause", dict(_PAUSE_DEFAULTS))
+        pause["manual"] = True
+        pause["announced"] = "quiet"
+
+    @staticmethod
+    def _apply_resume(state: dict) -> None:
+        pause = state.setdefault("pause", dict(_PAUSE_DEFAULTS))
+        pause["manual"] = False
+        pause["announced"] = "active"
+        now = datetime.now()
+        if settings.CLAIRE_QUIET_HOURS_ENABLED and _in_quiet_hours(
+            now, settings.CLAIRE_QUIET_HOURS_START, settings.CLAIRE_QUIET_HOURS_END
+        ):
+            # Waking up inside quiet hours: stay awake until the window ends,
+            # then tonight's window engages normally again.
+            pause["override_until"] = _quiet_hours_end(
+                now, settings.CLAIRE_QUIET_HOURS_END
+            ).isoformat()
+
+    def pause(self) -> None:
+        """Hold new notifications (persists; used by POST /claire/pause)."""
+        state = self._load_state()
+        self._apply_pause(state)
+        self._save_state(state)
+        logger.info("Claire: paused (manual)")
+
+    def resume(self) -> None:
+        """Resume notifications (persists; used by POST /claire/resume)."""
+        state = self._load_state()
+        self._apply_resume(state)
+        self._save_state(state)
+        logger.info("Claire: resumed")
+
+    def _announce_pause_transition(self, paused: bool, reason: str) -> None:
+        """
+        Post one Chat message when quiet hours automatically start or end.
+        Manual pause/resume announce themselves at command time, so this
+        only speaks for clock-driven transitions.
+        """
+        state = self._load_state()
+        pause = state.setdefault("pause", dict(_PAUSE_DEFAULTS))
+        current = "quiet" if paused else "active"
+        if pause.get("announced", "") == current:
+            return
+        if current == "quiet" and reason == "quiet_hours":
+            self._send_tracked(
+                f"🌙 Quiet hours — holding notifications until "
+                f"{settings.CLAIRE_QUIET_HOURS_END}. Say *resume* to wake me early."
+            )
+        elif current == "active" and pause.get("announced") == "quiet":
+            self._send_tracked("☀️ Quiet hours over — resuming. Scanning your inbox now.")
+        pause["announced"] = current
+        self._save_state(state)
 
     # ------------------------------------------------------------------
     # Cycle steps
@@ -473,6 +631,26 @@ class ClaireAgent:
                 continue
 
             lower_text = text.lower().strip()
+
+            # --- Space-level: pause / resume (exact match, checked first) ---
+            pause_cmd = _match_pause_command(text)
+            if pause_cmd == "pause":
+                self._apply_pause(state)
+                self._send_tracked(
+                    "⏸️ Paused — no new notifications until you say *resume*.\n"
+                    "I'm still listening: card replies and space commands keep working."
+                )
+                self._processed_chat_names.add(name)
+                handled += 1
+                state_dirty = True
+                continue
+            if pause_cmd == "resume":
+                self._apply_resume(state)
+                self._send_tracked("▶️ Resumed — I'll scan your inbox on the next cycle.")
+                self._processed_chat_names.add(name)
+                handled += 1
+                state_dirty = True
+                continue
 
             # --- Space-level: next batch ---
             if any(kw in lower_text for kw in ("next 10", "next batch", "more", "next")):
@@ -1081,6 +1259,7 @@ class ClaireAgent:
             "notification_queue": [],
             "seen_junk_threads": [],
             "sent_message_names": [],
+            "pause": dict(_PAUSE_DEFAULTS),
         }
 
     def _load_state(self) -> dict:

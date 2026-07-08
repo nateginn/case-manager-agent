@@ -585,3 +585,30 @@ rerun `test_prompt_emr_login.py --headed` from D:/Dev/case-manager-agent/.
 
 **Deploy set now also includes**: tools/prompt_emr_browser_tool.py, utils.py,
 tests/test_prompt_emr_matching.py (on top of the 2026-07-06 list).
+
+## 2026-07-07 (evening) — Pause/resume via Chat + quiet hours
+
+Problem: the old POST /claire/pause skipped the ENTIRE cycle (incl. Chat
+polling) so a paused Claire couldn't hear "resume"; flag was memory-only.
+
+New semantics — paused = mute, keep listening:
+- run_cycle: when paused, ONLY `_poll_chat_replies()` runs (card replies and
+  space commands still work); scan/nudges/expiry/auto-drafts skipped.
+- Space-level Chat commands (EXACT match after normalization, unlike the
+  containment-matched commands): pause / good night / goodnight / sleep;
+  resume / unpause / wake up / good morning. Confirmations: "⏸️ Paused…",
+  "▶️ Resumed…". New prefixes added to _CLAIRE_MSG_PREFIXES.
+- Quiet hours: CLAIRE_QUIET_HOURS_ENABLED=true, START=21:00, END=07:00
+  (local, .env-overridable, window may span midnight). One-time transition
+  announcements 🌙/☀️ tracked via pause.announced.
+- "resume" during quiet hours sets pause.override_until = end of current
+  window — awake for the rest of the night, tonight re-engages normally.
+- State persisted in claire_state.json under "pause"
+  {manual, override_until, announced} — survives restarts. "new day" wipes
+  it (fresh start = active).
+- main.py: _claire_paused global removed; worker always calls run_cycle;
+  /claire/pause|resume delegate to agent.pause()/resume(); /health adds
+  claire_pause_reason ("manual"|"quiet_hours"|"").
+- Helpers in claire_agent.py: _match_pause_command, _in_quiet_hours,
+  _quiet_hours_end, ClaireAgent._compute_paused/_apply_pause/_apply_resume/
+  _announce_pause_transition. 169 tests passing (+21, tests/test_pause.py).
